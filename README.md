@@ -1,5 +1,8 @@
 # libsigma
 
+[![ci](https://github.com/advens/libsigma/actions/workflows/ci.yml/badge.svg)](https://github.com/advens/libsigma/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+
 C11 engine for compiled [Sigma](https://sigmahq.io/) rules. It `mmap()`s a
 `.sigmac` bytecode file, evaluates events through a field-lookup callback, and
 runs an in-process correlator. Sigma YAML is never parsed at match time.
