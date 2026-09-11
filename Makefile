@@ -234,8 +234,8 @@ libfuzz: $(BUILDDIR) $(BUILDDIR)/seed.sigmac $(BUILDDIR)/libsigma.a
 		$(PCRE2_CFLAGS) $(SRCDIR)/fuzz_match.c $(SRCDIR)/sigma_match.c \
 		$(SRCDIR)/sigma_format.c $(PCRE2_LIBS) -o $(BUILDDIR)/fuzz_match
 	$(FUZZ_CC) -std=c11 $(WARN) -O1 -g -fsanitize=fuzzer,address,undefined \
-		$(JSON_CFLAGS) $(SRCDIR)/fuzz_contrib.c $(SRCDIR)/contrib_wire.c \
-		$(JSON_LIBS) -o $(BUILDDIR)/fuzz_contrib
+		$(FUZZ_JSON_CFLAGS) $(SRCDIR)/fuzz_contrib.c $(SRCDIR)/contrib_wire.c \
+		$(FUZZ_JSON_LIBS) -o $(BUILDDIR)/fuzz_contrib
 	$(BUILDDIR)/fuzz_load -runs=$(FUZZ_RUNS) -max_len=$(FUZZ_MAXLEN) \
 		-timeout=2 $(SRCDIR)/fuzz_corpus/load
 	$(BUILDDIR)/fuzz_match -runs=$(FUZZ_RUNS) -max_len=$(FUZZ_MAXLEN) \
@@ -274,8 +274,8 @@ libfuzz-ci: $(BUILDDIR)
 	UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 	../$(BUILDDIR)/fuzz_match $(FUZZ_CI_FLAGS) ../$(BUILDDIR)/corpus_match
 	@if $(FUZZ_CC) -std=c11 $(WARN) -O1 -g -fsanitize=fuzzer,address,undefined \
-		$(JSON_CFLAGS) $(SRCDIR)/fuzz_contrib.c $(SRCDIR)/contrib_wire.c \
-		$(JSON_LIBS) -o $(BUILDDIR)/fuzz_contrib; then \
+		$(FUZZ_JSON_CFLAGS) $(SRCDIR)/fuzz_contrib.c $(SRCDIR)/contrib_wire.c \
+		$(FUZZ_JSON_LIBS) -o $(BUILDDIR)/fuzz_contrib; then \
 		ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
 		UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 		$(BUILDDIR)/fuzz_contrib $(FUZZ_CI_FLAGS) $(BUILDDIR)/corpus_contrib; \
