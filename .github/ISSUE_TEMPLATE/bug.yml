@@ -8,7 +8,9 @@ body:
       value: |
         Scope in the title must be one of
         `match` `format` `corr` `contrib` `simd` `fuzz` `cli` `build`.
-        This is a C library. Host-integration glue is out of scope here.
+        This is a C library; host-integration glue is out of scope here.
+        See [CONTRIBUTING.md](https://github.com/advens/libsigma/blob/main/CONTRIBUTING.md)
+        for the commit and branch contract.
   - type: input
     id: commit
     attributes:
@@ -45,6 +47,7 @@ body:
       placeholder: |
         make test
         ...
+      render: shell
     validations:
       required: true
   - type: dropdown

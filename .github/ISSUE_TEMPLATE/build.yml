@@ -5,7 +5,10 @@ labels: ["build"]
 body:
   - type: markdown
     attributes:
-      value: Scope is `build`, `fuzz`, `cli`, or `github`.
+      value: |
+        Scope is `build`, `fuzz`, `cli`, or `github`.
+        See [CONTRIBUTING.md](https://github.com/advens/libsigma/blob/main/CONTRIBUTING.md)
+        for the commit and branch contract.
   - type: input
     id: commit
     attributes:
@@ -30,6 +33,7 @@ body:
     attributes:
       label: Proof
       description: Exact command and output.
+      render: shell
     validations:
       required: true
   - type: dropdown
