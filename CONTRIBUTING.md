@@ -32,3 +32,7 @@ aarch64 NEON, scalar fallback). `make test` and `make san` before
 you ask for merge.
 
 Do not send YAML parsing, host-integration glue, or network code here.
+
+## Releasing
+
+`docs/RELEASING.md`, for whoever is cutting the next tag.
