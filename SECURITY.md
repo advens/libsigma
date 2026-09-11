@@ -24,7 +24,8 @@ reproducer (a hostile `.sigmac`, an input corpus, or a crashing command line).
 
 ## Supported versions
 
-Until 1.x, only the latest tagged release and `main` receive security fixes.
+Only the latest tagged release and `main` receive security fixes; older
+tags do not get backports.
 
 ## Hardening invariants
 
