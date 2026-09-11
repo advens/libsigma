@@ -120,7 +120,7 @@ PCRE2, and either json-c or libfastjson.
 |----------|----------|
 | Debian / Ubuntu | `libpcre2-dev libjson-c-dev pkg-config` |
 | Fedora / RHEL | `pcre2-devel json-c-devel pkgconf-pkg-config` |
-| FreeBSD | `pcre2 json-c pkgconf` |
+| FreeBSD | `pcre2 json-c pkgconf gmake`, plus a C compiler (base has none by default: `pkg install gcc14`, or an `llvmNN` package for clang, then build with `gmake CC=gcc14` / `CC=clang`; base `make` cannot parse this Makefile) |
 | macOS (Homebrew) | `pcre2 json-c pkg-config` |
 
 Dual-arch: amd64 builds with SSE4.2, aarch64 with NEON, and both agree
@@ -152,6 +152,8 @@ struct byte layouts, enumerations, CRC, and loader validation rules. A
 YAML-to-`.sigmac` compiler is a separate program; a standard-library Python
 reference emitter is bundled under `src/reference/sigmac/` and
 `make conformance` proves it byte-for-byte against the C loader.
+`src/docs/TUTORIAL.md` walks two real Sigma rules through hand-lowering,
+`.sigmac` emission, and a `sigma_cli` match, command by command.
 
 ## Embedding in another source tree
 
