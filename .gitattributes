@@ -1,0 +1,12 @@
+# Distfile is the C matcher. Root harness stays in git, not in
+# `git archive`. Leading slash so src/docs (format spec) still ships.
+/.githooks/      export-ignore
+/.github/        export-ignore
+/.gitignore      export-ignore
+/.gitmessage     export-ignore
+/.gitattributes  export-ignore
+/AGENTS.md       export-ignore
+/CONTRIBUTING.md export-ignore
+/SECURITY.md     export-ignore
+/docs/           export-ignore
+/scripts/        export-ignore

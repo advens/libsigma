@@ -1,0 +1,41 @@
+name: Build
+description: Compile, link, pkg-config, or CI harness
+title: "build(<scope>): "
+labels: ["build"]
+body:
+  - type: markdown
+    attributes:
+      value: Scope is `build`, `fuzz`, `cli`, or `github`.
+  - type: input
+    id: commit
+    attributes:
+      label: Commit or tag
+    validations:
+      required: true
+  - type: dropdown
+    id: arch
+    attributes:
+      label: Architecture
+      options: [aarch64, amd64, both, other]
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What failed
+    validations:
+      required: true
+  - type: textarea
+    id: proof
+    attributes:
+      label: Proof
+      description: Exact command and output.
+    validations:
+      required: true
+  - type: dropdown
+    id: contract
+    attributes:
+      label: Frozen surface
+      options: [none, abi]
+    validations:
+      required: true

@@ -1,0 +1,11 @@
+build/
+*.o
+*.so
+*.dylib
+crash-*
+leak-*
+timeout-*
+fuzz_corpus/load/
+fuzz_corpus/contrib/*
+!fuzz_corpus/contrib/seed_*.json
+!fuzz_corpus/contrib/bad_*.json

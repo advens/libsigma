@@ -1,0 +1,10 @@
+prefix=@PREFIX@
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: sigma
+Description: Compiled Sigma matcher and in-process correlator
+Version: @VERSION@
+Requires.private: libpcre2-8 @JSON_DEP@
+Libs: -L${libdir} -lsigma -lm -lpthread
+Cflags: -I${includedir}/sigma

@@ -1,0 +1,13 @@
+# Draft only. Do not submit until this repository is public.
+homepage: "https://github.com/advens/libsigma"
+main_repo: "https://github.com/advens/libsigma.git"
+language: c
+primary_contact: "jeremie.jourdin@advens.fr"
+fuzzing_engines:
+  - libfuzzer
+sanitizers:
+  - address
+  - undefined
+architectures:
+  - x86_64
+  - aarch64

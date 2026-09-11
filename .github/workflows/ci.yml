@@ -1,0 +1,88 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  commit-msg:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: check commit messages
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -eu
+          if [ -n "${PR_TITLE:-}" ]; then
+            printf '%s\n\n%s\n' "$PR_TITLE" "$PR_BODY" | scripts/check-commit-msg.sh --stdin
+          fi
+          if [ -n "${BASE:-}" ]; then
+            git rev-list --reverse "$BASE..$HEAD"
+          else
+            git rev-list --reverse -n 1 HEAD
+          fi | while read -r c; do
+            git log -1 --format=%B "$c" | scripts/check-commit-msg.sh --stdin
+          done
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libpcre2-dev libjson-c-dev pkg-config
+      - name: make test
+        run: make test
+      - name: make conformance
+        run: make conformance
+      - name: native vs scalar
+        run: make diffuzz-c-arch
+
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: brew install pcre2 json-c pkg-config
+      - name: make test
+        run: make test
+      - name: make conformance
+        run: make conformance
+
+  san:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libpcre2-dev libjson-c-dev pkg-config
+      - name: make san
+        run: make san
+
+  tsan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: make tsan
+        run: make tsan
+
+  diffuzz-arch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libpcre2-dev libjson-c-dev pkg-config
+      - name: native vs scalar
+        run: make diffuzz-c-arch

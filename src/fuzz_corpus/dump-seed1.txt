@@ -1,0 +1,36 @@
+# fuzz_diff seed=1
+M	eq	0	1	alert	2	0.20
+M	contains	0	1	alert	2	0.20
+M	contains	1	1	alert	2	0.20
+M	startswith	0	1	alert	2	0.20
+M	endswith	0	1	alert	2	0.20
+M	exists	0	1	alert	2	0.20
+M	gt	0	1	alert	2	0.20
+M	gt	2	1	alert	2	0.20
+M	gte	0	1	alert	2	0.20
+M	lt	0	1	alert	2	0.20
+M	lte	0	1	alert	2	0.20
+M	re	0	1	alert	2	0.20
+M	cidr4	0	1	alert	2	0.20
+M	cidr6	0	1	alert	2	0.20
+M	or_list	0	1	alert	2	0.20
+M	or_list	1	1	alert	2	0.20
+M	and_fields	0	1	alert	2	0.20
+M	not	0	1	alert	2	0.20
+M	or_cond	0	1	alert	2	0.20
+M	or_cond	1	1	alert	2	0.20
+M	cased	0	1	alert	2	0.20
+M	fieldref	0	1	alert	2	0.20
+M	re_i	0	1	alert	2	0.20
+M	re_i	1	1	alert	2	0.20
+M	windash	0	1	alert	2	0.20
+M	windash	1	1	alert	2	0.20
+M	rand_contains_0	0	1	alert	2	0.20
+M	rand_contains_1	0	1	alert	2	0.20
+M	rand_contains_2	0	1	alert	2	0.20
+M	rand_contains_3	0	1	alert	2	0.20
+M	rand_contains_4	0	1	alert	2	0.20
+M	rand_contains_5	0	1	alert	2	0.20
+M	rand_contains_6	0	1	alert	2	0.20
+M	rand_contains_7	0	1	alert	2	0.20
+C	corr_event_count	2	brute	3

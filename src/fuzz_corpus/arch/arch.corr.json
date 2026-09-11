@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "correlations": [
+    {
+      "id": "brute",
+      "title": "three fails",
+      "type": "event_count",
+      "base_rule_ids": [
+        1
+      ],
+      "base_rule_names": [
+        "ssh_failed_login"
+      ],
+      "group_by": [
+        "source.ip"
+      ],
+      "timespan_s": 300,
+      "condition": {
+        "op": "gte",
+        "count": 3
+      },
+      "mitre": null,
+      "level": "medium"
+    }
+  ]
+}

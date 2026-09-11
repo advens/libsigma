@@ -1,0 +1,5 @@
+event 1: rule=1 verdict=alert sev=2 score=0.20 mitre=-
+event 2: rule=1 verdict=alert sev=2 score=0.20 mitre=-
+event 3: rule=1 verdict=alert sev=2 score=0.20 mitre=-
+event 3: corr=brute observed=3
+event 4: rule=2 verdict=alert sev=2 score=0.20 mitre=-

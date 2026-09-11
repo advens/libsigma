@@ -1,0 +1,4 @@
+event.action=authentication_failure	source.ip=203.0.113.9	_ts=100
+event.action=authentication_failure	source.ip=203.0.113.9	_ts=101
+event.action=authentication_failure	source.ip=203.0.113.9	_ts=102
+dst_port=4444	destination.port=4444

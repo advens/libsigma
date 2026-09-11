@@ -1,0 +1,14 @@
+libsigma
+Copyright 2026 Advens
+
+This product includes software developed at Advens (https://www.advens.fr/).
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file.
+
+This software links, at the user's option, against:
+  - PCRE2 (https://www.pcre.org/) - BSD license
+  - json-c (https://github.com/json-c/json-c) - MIT license, or
+  - libfastjson (https://github.com/rsyslog/libfastjson) - MIT license
+
+Those libraries are not distributed with this source tree and carry their own
+license terms.
