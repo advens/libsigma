@@ -18,7 +18,7 @@ PREFIX     ?= /usr/local
 DESTDIR    ?=
 LIB_MAJOR  := 3
 LIB_MINOR  := 0
-LIB_PATCH  := 0
+LIB_PATCH  := 1
 SONAME     := libsigma.so.$(LIB_MAJOR)
 SOFILE     := libsigma.so.$(LIB_MAJOR).$(LIB_MINOR).$(LIB_PATCH)
 
