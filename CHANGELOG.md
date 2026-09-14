@@ -10,6 +10,22 @@ is called out explicitly.
 
 ## [Unreleased]
 
+## [3.0.1] - 2026-09-14
+
+### Security
+
+- A `|re` predicate matched an attacker-controlled event field value
+  against a pattern compiled from the `.sigmac` artifact using PCRE2's
+  own compiled-in default match/depth limit (no application-set match
+  context), which is not a value libsigma chooses or can rely on being
+  consistent across the platforms it ships for. An adversarial (pattern,
+  field value) pairing had no application-owned ceiling on the eval hot
+  path (CWE-1333). `sigma_match.c` now sets an explicit, deterministic
+  PCRE2 match/depth limit, shared read-only across threads; hitting the
+  limit degrades to the same safe non-match outcome PCRE2 already
+  returns for `PCRE2_ERROR_NOMATCH`, so this bounds worst-case time only
+  and never changes match correctness.
+
 ### Fixed
 
 - `sigma.pc`'s `Cflags` pointed `-I` at `${includedir}/sigma` instead of
@@ -72,5 +88,6 @@ First tagged release.
   the contribution codec; ASan/UBSan and TSan gates.
 - Normative on-disk format specification, `src/docs/SIGMAC_FORMAT.md`.
 
-[Unreleased]: https://github.com/advens/libsigma/compare/3.0.0...HEAD
+[Unreleased]: https://github.com/advens/libsigma/compare/3.0.1...HEAD
+[3.0.1]: https://github.com/advens/libsigma/releases/tag/3.0.1
 [3.0.0]: https://github.com/advens/libsigma/releases/tag/3.0.0
