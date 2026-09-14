@@ -35,6 +35,7 @@
 #include <pcre2.h> /* PCRE2 for SIGMA_OP_RE, the SigmaHQ regex dialect
                           * (\d, lookahead, non-greedy, inline (?ims) flags...)
                           * that POSIX ERE cannot compile. */
+#include <pthread.h> /* pthread_once for the lazily-built match context below */
 
 /* Compiled-regex side-table entry (db->re is an array of these, sized n_preds;
  * only RE predicates are compiled). Built by sigma_db_finalize, freed by
@@ -43,6 +44,46 @@ typedef struct {
     pcre2_code* re; /* compiled pattern; shared read-only across workers */
     uint8_t valid;
 } sigma_re_t;
+
+/* Bound PCRE2 match-time resource use (CWE-1333). A |re predicate matches
+ * an attacker-controlled field value (event/message content) against a
+ * pattern compiled from a .sigmac artifact; the loader validates that
+ * artifact's structure but not a pattern's worst-case backtracking
+ * complexity, so an adversarial (pattern, field value) pairing could
+ * otherwise spend an unbounded number of match steps on the eval hot
+ * path with no application-set ceiling -- pcre2_match() falls back to
+ * PCRE2's own compiled-in defaults when given no match context, which
+ * exist but are not tuned for this. The limits below are generous
+ * relative to real Sigma `|re` patterns and field lengths (JIT-compiled,
+ * see sigma_db_finalize): a legitimate match returns well under them; an
+ * adversarial one is capped rather than left unbounded. pcre2_match()
+ * already treats any negative return (PCRE2_ERROR_NOMATCH included) as
+ * "this predicate did not match", so a limit hit degrades to a normal,
+ * safe non-match with no separate handling needed.
+ *
+ * Fixed policy, not derived from any db, so ONE lazily-built context is
+ * shared read-only across every thread and every sigma_db_t -- avoiding
+ * an ABI-breaking field on the public sigma_db_t struct for what is a
+ * process-wide constant. pthread_once makes the first-use build race-safe
+ * regardless of how many threads/dbs reach it concurrently. Never freed:
+ * one small, fixed-size, process-lifetime object, still reachable (not
+ * leaked) at exit. */
+#define SIGMA_RE_MATCH_LIMIT 100000u
+#define SIGMA_RE_DEPTH_LIMIT 10000u
+
+static pthread_once_t g_re_mctx_once = PTHREAD_ONCE_INIT;
+static pcre2_match_context* g_re_mctx = NULL;
+
+static void sigma_re_mctx_init(void) {
+    g_re_mctx = pcre2_match_context_create(NULL);
+    if (g_re_mctx) {
+        pcre2_set_match_limit(g_re_mctx, SIGMA_RE_MATCH_LIMIT);
+        pcre2_set_depth_limit(g_re_mctx, SIGMA_RE_DEPTH_LIMIT);
+    }
+    /* On allocation failure g_re_mctx stays NULL; pcre2_match() already
+     * accepts a NULL context (today's behavior), so this degrades safely
+     * rather than crashing. */
+}
 
 /* Bounded RPN evaluation stack depth.  A compiled condition over N selections
  * needs at most N pushes; we cap at a generous fixed size and the builder
@@ -267,8 +308,12 @@ static bool pred_match(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigm
                 e->md = pcre2_match_data_create(1, NULL);
                 if (!e->md) break;
             }
-            /* PCRE2 matches a length-delimited subject, no NUL copy needed. */
-            res = (pcre2_match(arr[pred_idx].re, (PCRE2_SPTR)val, vlen, 0, 0, e->md, NULL) >= 0);
+            pthread_once(&g_re_mctx_once, sigma_re_mctx_init);
+            /* PCRE2 matches a length-delimited subject, no NUL copy needed.
+             * g_re_mctx bounds match/depth (see its definition above); a
+             * limit hit returns negative, already handled by >= 0 below
+             * exactly like PCRE2_ERROR_NOMATCH -- no separate branch. */
+            res = (pcre2_match(arr[pred_idx].re, (PCRE2_SPTR)val, vlen, 0, 0, e->md, g_re_mctx) >= 0);
             break;
         }
         default: {

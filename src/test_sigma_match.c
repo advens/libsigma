@@ -35,6 +35,7 @@
 #include <string.h>
 #include <assert.h>
 #include <stdbool.h>
+#include <time.h> /* clock(), for the |re match-limit bound test */
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -1665,6 +1666,122 @@ static void test_prefilter_fwit(void) {
     }
 }
 
+/* CWE-1333: a |re predicate matches an attacker-controlled field value
+ * against a pattern the .sigmac loader validates structurally but not for
+ * worst-case backtracking complexity. Without an application-set PCRE2
+ * match/depth limit, matcher.c fell back to PCRE2's own compiled-in
+ * default (10,000,000 on a stock build -- confirmed via pcre2_config()),
+ * a number libsigma neither chooses nor can rely on being consistent
+ * across the amd64/aarch64 x Debian/Ubuntu/Alpine/FreeBSD/macOS matrix it
+ * ships for. Two things must hold with the fix in place: a classic
+ * catastrophic-backtracking pattern against an adversarial non-matching
+ * subject still resolves to the CORRECT answer (no rule fires -- hitting
+ * a limit and exhausting the pattern legitimately both return a negative
+ * PCRE2 code, already handled identically by the existing `>= 0` check,
+ * so this changes worst-case TIME only, never correctness) inside a
+ * generous bound; and an ordinary, non-pathological |re rule keeps
+ * matching a normal, moderately long benign value exactly as before. */
+static void test_re_match_limit_bounded(void) {
+    /* --- adversarial: ^(a+)+$ against a long run of 'a' + a trailing
+     * mismatch is the textbook catastrophic-backtracking shape. n=40 is
+     * unreachable from the loader's own bounds/CRC checks (this is a
+     * behavioral, not structural, input) and, empirically, costs the
+     * *default* PCRE2 policy 100-1000x this test's bound on the
+     * interpreted matcher path (a live fallback: pcre2_jit_compile's
+     * return value is intentionally ignored -- JIT is best-effort, not
+     * guaranteed -- so some pattern/platform combination always exercises
+     * the interpreted matcher this bound also has to hold for). */
+    {
+        tb_t* t = calloc(1, sizeof(*t));
+        assert(t);
+        {
+            uint32_t ps = t->db.n_preds;
+            tb_pred_str(t, "process.command_line", SIGMA_OP_RE, "^(a+)+$", 0, 0);
+            tb_rule(t, 4001, tb_sel(t, ps), 1, 0, 0, SIGMA_VERDICT_ALERT, 3, 30);
+        }
+        sigma_db_t db = tb_finish(t);
+        uint8_t* buf = NULL;
+        size_t len = 0;
+        CHECK(sigma_db_serialize(&db, &buf, &len) == SIGMA_OK, "re-limit: serialize ok");
+        uint8_t* copy = malloc(len);
+        assert(copy);
+        memcpy(copy, buf, len);
+        sigma_db_t d;
+        memset(&d, 0, sizeof(d));
+        CHECK(sigma_db_load_buffer(copy, len, &d) == SIGMA_OK, "re-limit: load ok (compiles the RE)");
+
+        char adversarial[42];
+        memset(adversarial, 'a', 40);
+        adversarial[40] = 'X'; /* breaks the match only at the very end */
+        adversarial[41] = '\0';
+
+        sigma_eval_t* ev = sigma_eval_create(&d);
+        assert(ev);
+        kv_t kv[] = {{"process.command_line", adversarial}};
+        event_t e = {kv, 1};
+
+        clock_t t0 = clock();
+        bool fired = fires(ev, &e, 4001, NULL);
+        double secs = (double)(clock() - t0) / CLOCKS_PER_SEC;
+
+        CHECK(!fired, "re-limit: ^(a+)+$ vs adversarial non-match must not fire");
+        /* Generous: the bounded path measured well under 0.01s in
+         * development; 2s leaves ample headroom for a slow/loaded CI
+         * runner while still failing hard if the match_context is ever
+         * dropped and a build/platform combination hits a much larger
+         * (or absent) PCRE2 default on the interpreted matcher path. */
+        CHECK(secs < 2.0, "re-limit: adversarial match must stay bounded (CWE-1333)");
+
+        sigma_eval_free(ev);
+        sigma_db_free(&d);
+        free(buf);
+        sigma_db_free(&db);
+        free(t);
+    }
+
+    /* --- benign: an ordinary anchored alternation against a normal,
+     * moderately long legitimate command line must still fire. Proves the
+     * new match/depth limit does not turn into a false negative on real
+     * traffic; 100000/10000 is generous relative to any real Sigma |re
+     * pattern's actual step count. */
+    {
+        tb_t* t = calloc(1, sizeof(*t));
+        assert(t);
+        {
+            uint32_t ps = t->db.n_preds;
+            tb_pred_str(t, "process.command_line", SIGMA_OP_RE, "(mimikatz|sekurlsa)\\.exe", 0, 0);
+            tb_rule(t, 4002, tb_sel(t, ps), 1, 0, 0, SIGMA_VERDICT_ALERT, 3, 30);
+        }
+        sigma_db_t db = tb_finish(t);
+        uint8_t* buf = NULL;
+        size_t len = 0;
+        CHECK(sigma_db_serialize(&db, &buf, &len) == SIGMA_OK, "re-limit: benign serialize ok");
+        uint8_t* copy = malloc(len);
+        assert(copy);
+        memcpy(copy, buf, len);
+        sigma_db_t d;
+        memset(&d, 0, sizeof(d));
+        CHECK(sigma_db_load_buffer(copy, len, &d) == SIGMA_OK, "re-limit: benign load ok");
+
+        char benign[256];
+        snprintf(benign, sizeof(benign),
+                 "C:\\Windows\\System32\\cmd.exe /c C:\\tools\\mimikatz.exe "
+                 "privilege::debug sekurlsa::logonpasswords exit");
+
+        sigma_eval_t* ev = sigma_eval_create(&d);
+        assert(ev);
+        kv_t kv[] = {{"process.command_line", benign}};
+        event_t e = {kv, 1};
+        CHECK(fires(ev, &e, 4002, NULL), "re-limit: benign match still fires under the new limit");
+
+        sigma_eval_free(ev);
+        sigma_db_free(&d);
+        free(buf);
+        sigma_db_free(&db);
+        free(t);
+    }
+}
+
 /* The loader accepts SIGMA_FORMAT_VERSION_MIN through SIGMA_FORMAT_VERSION: a
  * well-formed artifact whose ONLY defect is a wrong version must be REJECTED
  * cleanly with SIGMA_ERR_VERSION and leave the out-db untouched (no ownership
@@ -1854,6 +1971,7 @@ int main(void) {
     test_prefilter();
     test_prefilter_cnf();
     test_prefilter_fwit();
+    test_re_match_limit_bounded();
 
     printf("\nlibsigma matcher+format: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
