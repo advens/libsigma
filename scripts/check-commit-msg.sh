@@ -1,12 +1,18 @@
 #!/bin/sh
 # Validate a commit message against docs/COMMIT.md.
-# Usage: check-commit-msg.sh <file> | check-commit-msg.sh --stdin
+# Usage: check-commit-msg.sh [--label <text>] <file> | --stdin
 set -eu
 
 usage() {
-    echo "usage: $0 <file> | --stdin" >&2
+    echo "usage: $0 [--label <text>] <file> | --stdin" >&2
     exit 2
 }
+
+_label=""
+if [ "${1-}" = "--label" ]; then
+    _label=" [$2]"
+    shift 2
+fi
 
 if [ "${1-}" = "--stdin" ]; then
     msg=$(cat)
@@ -21,12 +27,12 @@ fi
 msg=$(printf '%s\n' "$msg" | sed '/^#/d' | sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}')
 
 if [ -z "$msg" ]; then
-    echo "check-commit-msg: empty message" >&2
+    echo "check-commit-msg${_label}: empty message" >&2
     exit 1
 fi
 
 fail() {
-    echo "check-commit-msg: $1" >&2
+    echo "check-commit-msg${_label}: $1" >&2
     exit 1
 }
 
@@ -84,4 +90,4 @@ if printf '%s' "$proof_next" | grep -qx 'not run:'; then
     fail "Proof: 'not run:' needs a reason"
 fi
 
-echo "check-commit-msg: ok"
+echo "check-commit-msg${_label}: ok"
