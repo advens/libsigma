@@ -22,9 +22,17 @@ else
     usage
 fi
 
-# Drop comment lines (git commit -v / template leftovers) and trailing
-# whitespace-only lines at EOF, keep the rest exact.
-msg=$(printf '%s\n' "$msg" | sed '/^#/d' | sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}')
+# Normalise line endings and encoding before any validation:
+# - strip CR (CRLF from Windows editors or GitHub PR body)
+# - strip UTF-8 BOM if present (Windows Notepad / some VS Code configs)
+# - strip trailing whitespace from every line (editors often pad Why:/Proof:)
+# Then drop comment lines and trailing blank lines at EOF.
+msg=$(printf '%s\n' "$msg" \
+  | tr -d '\r' \
+  | sed '1s/^\xef\xbb\xbf//' \
+  | sed 's/[[:space:]]*$//' \
+  | sed '/^#/d' \
+  | sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}')
 
 if [ -z "$msg" ]; then
     echo "check-commit-msg${_label}: empty message" >&2
