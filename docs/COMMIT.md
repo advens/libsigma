@@ -30,7 +30,9 @@ is allowed after `Contract:`. Nothing else.
 - `<scope>` is one of: `match` `format` `corr` `contrib` `simd` `fuzz`
   `cli` `build` `github` `docs`
 - `<subject>` is imperative, ASCII, no trailing period, no em-dash
-- The whole first line is at most 72 characters
+- The whole first line is at most 72 characters. GitHub squash-merge
+  appends ` (#<n>)` to the subject on `main`; that suffix is hosting
+  metadata and is not counted
 - The first line is the only summary. Do not repeat it in Why.
 
 ## Why

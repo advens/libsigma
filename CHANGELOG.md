@@ -10,6 +10,13 @@ is called out explicitly.
 
 ## [Unreleased]
 
+### Fixed
+
+- GitHub squash-merge appends ` (#<n>)` to the commit subject. The
+  commit-msg checker counted that suffix toward the 72-character cap,
+  so a PR whose title passed CI failed on `main` after merge. The
+  suffix is now stripped before first-line checks.
+
 ## [3.0.1] - 2026-09-14
 
 ### Security
