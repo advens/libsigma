@@ -47,6 +47,12 @@ fail() {
 first=$(printf '%s\n' "$msg" | sed -n '1p')
 second=$(printf '%s\n' "$msg" | sed -n '2p')
 
+# GitHub squash-merge appends " (#<n>)" to the subject. That suffix is
+# hosting metadata, not part of the first-line contract (length, type,
+# trailing period). Strip it before those checks so a PR title that
+# passed CI does not fail on main after merge.
+first=$(printf '%s' "$first" | sed 's/ (#[0-9][0-9]*)$//')
+
 printf '%s' "$first" | grep -q $'[\xE2\x80\x94]' && fail "em-dash in first line"
 printf '%s\n' "$msg" | grep -q $'[\xE2\x80\x94]' && fail "em-dash in message"
 printf '%s\n' "$msg" | grep -qiE 'co-authored-by:.*(claude|copilot|chatgpt|anthropic|openai|cursor|codex|grok)' && \

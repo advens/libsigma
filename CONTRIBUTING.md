@@ -12,7 +12,8 @@ git config commit.template .gitmessage
 
 PRs squash-merge. The PR title is the subject. The PR body is Why /
 Proof / Contract. CI runs `scripts/check-commit-msg.sh` on every
-commit in the PR and will reject a squash that does not match.
+commit in the PR and on the squash on `main`. GitHub's squash
+` (#<n>)` suffix is not part of the 72-character subject.
 
 ## Branches
 
