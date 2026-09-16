@@ -54,6 +54,5 @@ body:
     id: contract
     attributes:
       label: Frozen surface
-      options: [none, abi, format, wire]
-    validations:
-      required: true
+      description: Leave blank if no frozen surface is affected.
+      options: [abi, format, wire]
