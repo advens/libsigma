@@ -3,8 +3,36 @@
 
 #include "contrib_wire.h"
 
+#include <limits.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 /* json.h comes from contrib_wire.h */
+
+/* The corr_owner_key string for c as a JSON string, sized to fit (no cap), or
+ * NULL on overflow or allocation failure. */
+static json_object* owner_key_json(const corr_contrib_t* c) {
+    size_t len = strlen(c->corr_id);
+    size_t i;
+    char* buf;
+    json_object* s;
+    for (i = 0; i < c->n_group; i++) {
+        const char* gv = (c->group_vals && c->group_vals[i]) ? c->group_vals[i] : "";
+        size_t gl = strlen(gv);
+        if (gl > SIZE_MAX - 2 - len) return NULL;
+        len += 1 + gl;
+    }
+    if (len > (size_t)INT_MAX) return NULL;
+    buf = malloc(len + 1);
+    if (!buf) return NULL;
+    if (corr_owner_key(buf, len + 1, c->corr_id, c->group_vals, c->n_group) != len) {
+        free(buf);
+        return NULL;
+    }
+    s = json_object_new_string_len(buf, (int)len);
+    free(buf);
+    return s;
+}
 
 static const char* kind_name(corr_contrib_kind_t k) {
     switch (k) {
@@ -46,6 +74,7 @@ json_object* corr_contrib_to_json(const corr_contrib_t* c, const char* origin) {
     const char* kn;
     json_object* j;
     json_object* g;
+    json_object* key;
     size_t i;
     if (!c) return NULL;
     kn = kind_name(c->kind);
@@ -63,6 +92,13 @@ json_object* corr_contrib_to_json(const corr_contrib_t* c, const char* origin) {
         json_object_array_add(g, json_object_new_string(gv));
     }
     json_object_object_add(j, "group", g);
+    /* the routing key a hash transport needs to reach the owner peer */
+    key = owner_key_json(c);
+    if (!key) {
+        json_object_put(j);
+        return NULL;
+    }
+    json_object_object_add(j, "key", key);
     if (c->kind == CORR_CONTRIB_COUNT)
         json_object_object_add(j, "count", json_object_new_int64(c->count ? c->count : 1));
     if (c->kind == CORR_CONTRIB_SUM) {

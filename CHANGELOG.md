@@ -10,6 +10,21 @@ is called out explicitly.
 
 ## [Unreleased]
 
+### Changed
+
+- Contrib wire: `corr_owner_index` now hashes the owner key with djb2
+  followed by the murmur3 fmix32 finalizer, over the whole key. This is
+  the hash rsyslog omfwd `pool.policy="hash"` applies, so the transport
+  delivers each contribution to the peer that accepts it. Plain djb2
+  modulo a power of two reduced to a byte sum of the key (anagram groups
+  shared an owner, one byte picked it), and keys over 511 bytes all went
+  to peer 0. Every peer of a ring must run the same version: a peer on
+  the old hash refuses contributions the new one routes to it. `"v"`
+  stays 1.
+- `corr_contrib_to_json` adds `"key"`, the `corr_owner_key` string, so a
+  transport can route without rebuilding it from `corr_id` and `group`.
+  Parsers ignore it.
+
 ### Fixed
 
 - GitHub squash-merge appends ` (#<n>)` to the commit subject. The
