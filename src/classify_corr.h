@@ -33,7 +33,7 @@
  * Cross-instance: commutative types can MERGE COUNT/SUM/SEEN/DISTINCT
  * contributions from a peer (corr_on_contribution). The library does not open
  * sockets: the caller carries contributions between instances on whatever
- * transport it already has. Owner selection is corr_owner_index (djb2).
+ * transport it already has. Owner selection is corr_owner_index.
  * temporal_ordered and raw beaconing stay local-only.
  *
  * Threading (engine-concurrent): a corr_engine_t carries MUTABLE
@@ -372,13 +372,14 @@ int corr_on_event_apply(corr_engine_t* e,
                         corr_apply_fn apply,
                         void* apply_ctx);
 
-/* djb2 hash of corr_id + TAB + group values, modulo n_peers: which peer owns
- * this group when correlation state is sharded across instances.
- * n_peers==0 returns 0. */
+/* Which peer owns this group when correlation state is sharded across
+ * instances: djb2 of the corr_owner_key bytes, murmur3 fmix32, modulo n_peers.
+ * Equal to rsyslog omfwd pool.policy="hash" over the same key, for keys of any
+ * length. n_peers==0 returns 0. */
 size_t corr_owner_index(const char* corr_id, const char* const* group_vals, size_t n_group, size_t n_peers);
 
 /* Render the routing key the caller's transport should hash to reach the owner:
- * "id\\tval0\\tval1...".
+ * "id\\tval0\\tval1...". corr_contrib_to_json carries it as "key".
  * Returns bytes written excluding NUL, 0 if buf too small. */
 size_t corr_owner_key(char* buf, size_t cap, const char* corr_id, const char* const* group_vals, size_t n_group);
 

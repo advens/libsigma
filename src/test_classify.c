@@ -1037,6 +1037,47 @@ static void test_apply_skip_and_owner(void) {
     const char* g2[] = {"10.0.0.2", "root"};
     /* different group may or may not collide; just check in range */
     CHECK(corr_owner_index("brute", g2, 2, 7) < 7, "owner: other group in range");
+    /* Owner equals rsyslog omfwd pool.policy="hash" over the corr_owner_key
+     * bytes. Expected values come from omfwd_hash_key in tools/omfwd.c,
+     * compiled as is: the transport delivers to the peer that accepts. */
+    {
+        const char* gr[] = {"141.94.65.213"};
+        const char* gw[] = {"62.60.130.224"};
+        const char* ge[] = {"", ""};
+        CHECK(corr_owner_index("brute", g1, 2, 4) == 1, "owner: omfwd vector 4 peers");
+        CHECK(corr_owner_index("brute", g1, 2, 7) == 6, "owner: omfwd vector 7 peers");
+        CHECK(corr_owner_index("brute", g1, 2, 8) == 5, "owner: omfwd vector 8 peers");
+        CHECK(corr_owner_index("brute", g2, 2, 7) == 4, "owner: omfwd vector other group");
+        CHECK(corr_owner_index("brute", NULL, 0, 7) == 2, "owner: omfwd vector no group");
+        CHECK(corr_owner_index("corr_firewall_port_scan", gr, 1, 4) == 3, "owner: omfwd vector scan");
+        CHECK(corr_owner_index("corr_web_login_bruteforce", gw, 1, 4) == 2, "owner: omfwd vector login");
+        CHECK(corr_owner_index("x", ge, 2, 8) == 0, "owner: omfwd vector empty groups");
+    }
+    /* A key past any fixed buffer still has its own owner, the omfwd one. */
+    {
+        static char longv[601];
+        const char* gl[] = {longv};
+        memset(longv, 'a', 600);
+        longv[600] = '\0';
+        CHECK(corr_owner_index("brute", gl, 1, 4) == 1, "owner: 606-byte key, omfwd vector");
+        CHECK(corr_owner_index("brute", gl, 1, 7) == 6, "owner: 606-byte key, 7 peers");
+    }
+    /* Anagram groups must not share an owner by construction: plain djb2 mod
+     * a power of two is a byte sum and maps every permutation together. */
+    {
+        size_t spread[4] = {0, 0, 0, 0};
+        size_t used = 0;
+        char v[5] = {0};
+        const char* gp[] = {v};
+        const char* perms[] = {"abcd", "abdc", "acbd", "acdb", "adbc", "adcb", "bacd", "badc",
+                               "bcad", "bcda", "bdac", "bdca", "cabd", "cadb", "cbad", "cbda"};
+        for (size_t p = 0; p < sizeof perms / sizeof *perms; p++) {
+            memcpy(v, perms[p], 4);
+            spread[corr_owner_index("brute", (const char* const*)gp, 1, 4)]++;
+        }
+        for (size_t p = 0; p < 4; p++) used += spread[p] > 0;
+        CHECK(used > 1, "owner: anagram groups spread over peers");
+    }
     /* Ingest contract (one owner per group): a group has exactly one owner
      * in a static ring. Non-owners drop the contrib. */
     {

@@ -1885,11 +1885,24 @@ int corr_rule_hits(const corr_rule_t* r, const uint32_t* rids, size_t n_rids) {
     return 0;
 }
 
-static unsigned corr_djb2(const char* s) {
-    unsigned h = 5381;
+/* djb2 step over a NUL-terminated string, continuing from h. */
+static unsigned corr_djb2_feed(unsigned h, const char* s) {
     if (s != NULL) {
         while (*s) h = ((h << 5) + h) + (unsigned char)*s++;
     }
+    return h;
+}
+
+/* murmur3 fmix32. djb2's multiplier 33 is 1 modulo every power of two up to
+ * 2^5, so djb2 % n for n in {2, 4, 8, 16, 32} is a byte sum of the key:
+ * anagrams collide and one changed byte picks the owner. The finalizer mixes
+ * every input bit into the low bits, with no seed, so every peer still agrees. */
+static unsigned corr_fmix32(unsigned h) {
+    h ^= h >> 16;
+    h *= 0x85ebca6bu;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35u;
+    h ^= h >> 16;
     return h;
 }
 
@@ -1913,9 +1926,16 @@ size_t corr_owner_key(char* buf, size_t cap, const char* corr_id, const char* co
     return n;
 }
 
+/* Hashes the corr_owner_key bytes as they stream, so a key of any length has
+ * an owner. The value equals rsyslog omfwd pool.policy="hash" over the same
+ * key, which is how the transport delivers a contribution to its owner. */
 size_t corr_owner_index(const char* corr_id, const char* const* group_vals, size_t n_group, size_t n_peers) {
-    char key[512];
+    unsigned h = 5381;
     if (n_peers == 0) return 0;
-    if (corr_owner_key(key, sizeof(key), corr_id, group_vals, n_group) == 0) return 0;
-    return (size_t)(corr_djb2(key) % (unsigned)n_peers);
+    h = corr_djb2_feed(h, corr_id ? corr_id : "");
+    for (size_t i = 0; i < n_group; i++) {
+        h = ((h << 5) + h) + (unsigned char)'\t';
+        h = corr_djb2_feed(h, (group_vals && group_vals[i]) ? group_vals[i] : "");
+    }
+    return (size_t)(corr_fmix32(h) % (unsigned)n_peers);
 }
