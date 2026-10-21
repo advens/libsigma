@@ -139,9 +139,9 @@ Three surfaces are frozen and versioned independently of the release number:
 
 | Surface | Identifier | Notes |
 |---------|-----------|-------|
-| C ABI | SONAME `libsigma.so.3` | exported headers, `pkg-config` |
+| C ABI | SONAME `libsigma.so.4` | exported headers, `pkg-config` |
 | `.sigmac` format | `SIGMA_FORMAT_VERSION` = 5 | loader accepts 5 and 4; a v3 file is rejected |
-| contrib JSON | `"v"` = 1 | cross-instance contribution wire form |
+| contrib JSON | `"v"` = 1 | cross-instance contribution wire form; owner = `corr_owner_index` |
 
 A commit that touches one of these declares it (`Contract:` line, see
 `docs/COMMIT.md`) and needs a human merge owner.
