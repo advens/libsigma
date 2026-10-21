@@ -10,6 +10,11 @@ is called out explicitly.
 
 ## [Unreleased]
 
+## [4.0.0] - 2026-10-21
+
+MAJOR for the contrib wire change below: the SONAME is now
+`libsigma.so.4`. The C ABI itself is unchanged; consumers relink.
+
 ### Changed
 
 - Contrib wire: `corr_owner_index` now hashes the owner key with djb2
@@ -110,6 +115,7 @@ First tagged release.
   the contribution codec; ASan/UBSan and TSan gates.
 - Normative on-disk format specification, `src/docs/SIGMAC_FORMAT.md`.
 
-[Unreleased]: https://github.com/advens/libsigma/compare/3.0.1...HEAD
+[Unreleased]: https://github.com/advens/libsigma/compare/4.0.0...HEAD
+[4.0.0]: https://github.com/advens/libsigma/releases/tag/4.0.0
 [3.0.1]: https://github.com/advens/libsigma/releases/tag/3.0.1
 [3.0.0]: https://github.com/advens/libsigma/releases/tag/3.0.0
