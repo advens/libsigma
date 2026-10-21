@@ -192,18 +192,24 @@ test: $(BUILDDIR)/test_sigma_match $(BUILDDIR)/fuzz_simd \
 	$(BUILDDIR)/test_event_time
 	$(BUILDDIR)/test_wire
 
-san: $(BUILDDIR)/fuzz_simd $(BUILDDIR)/libsigma.a
+# The library sources are compiled into each sanitizer binary, not linked
+# from libsigma.a: an uninstrumented archive hides reads inside the library.
+san: $(BUILDDIR)/fuzz_simd
 	$(CC) $(CSTD) $(WARN) -O1 -g $(ARCHFLAGS) -fsanitize=address,undefined \
 		-o $(BUILDDIR)/fuzz_simd_san $(SRCDIR)/fuzz_simd.c
 	$(BUILDDIR)/fuzz_simd_san
-	$(CC) $(CFLAGS) -O1 -g -fsanitize=address,undefined -pthread \
+	$(CC) $(CFLAGS) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -pthread \
 		-o $(BUILDDIR)/test_classify_san $(SRCDIR)/test_classify.c \
-		$(BUILDDIR)/libsigma.a $(LIBS)
+		$(LIB_SRCS) $(LIBS)
 	$(BUILDDIR)/test_classify_san
-	$(CC) $(CFLAGS) -O1 -g -fsanitize=address,undefined \
+	$(CC) $(CFLAGS) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -pthread \
 		-o $(BUILDDIR)/test_event_time_san $(SRCDIR)/test_event_time.c \
-		$(BUILDDIR)/libsigma.a $(LIBS)
+		$(LIB_SRCS) $(LIBS)
 	$(BUILDDIR)/test_event_time_san
+	$(CC) $(CFLAGS) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -pthread \
+		-o $(BUILDDIR)/test_wire_san $(SRCDIR)/test_wire.c \
+		$(LIB_SRCS) $(LIBS)
+	$(BUILDDIR)/test_wire_san
 
 # Correlator only: libc + pthread + -lm, so this gate needs neither PCRE2
 # nor a JSON library on the runner.
