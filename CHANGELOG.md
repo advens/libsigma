@@ -10,6 +10,15 @@ is called out explicitly.
 
 ## [Unreleased]
 
+## [4.0.1] - 2026-11-10
+
+### Fixed
+
+- The engine builds without warnings under rsyslog's flags
+  (`-Wswitch-enum`, `-Wswitch-default`, `-Winline`). Switches on
+  `corr_type_t` and `corr_contrib_kind_t` name every value, and
+  `teddy_probe_at` is no longer declared inline. No result changes.
+
 ## [4.0.0] - 2026-10-21
 
 MAJOR for the contrib wire change below: the SONAME is now
@@ -115,7 +124,8 @@ First tagged release.
   the contribution codec; ASan/UBSan and TSan gates.
 - Normative on-disk format specification, `src/docs/SIGMAC_FORMAT.md`.
 
-[Unreleased]: https://github.com/advens/libsigma/compare/4.0.0...HEAD
+[Unreleased]: https://github.com/advens/libsigma/compare/4.0.1...HEAD
+[4.0.1]: https://github.com/advens/libsigma/releases/tag/4.0.1
 [4.0.0]: https://github.com/advens/libsigma/releases/tag/4.0.0
 [3.0.1]: https://github.com/advens/libsigma/releases/tag/3.0.1
 [3.0.0]: https://github.com/advens/libsigma/releases/tag/3.0.0
