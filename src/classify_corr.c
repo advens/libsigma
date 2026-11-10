@@ -872,6 +872,8 @@ static int cmp_threshold(int64_t observed, corr_op_t op, int64_t n) {
             return observed < n;
         case CORR_OP_EQ:
             return observed == n;
+        default:
+            break;
     }
     return observed >= n;
 }
@@ -942,6 +944,8 @@ static int cond_satisfied_f(corr_op_t op, double val, double thr) {
             return val < thr;
         case CORR_OP_EQ:
             return val == thr;
+        default:
+            break;
     }
     return val >= thr;
 }
@@ -1623,6 +1627,7 @@ int corr_on_event_apply(corr_engine_t* e,
                 case CORR_BEACONING:
                     fired_now = eval_beaconing(r, gs, ts, window_start, &e->stats);
                     break;
+                case CORR_TYPE__MAX:
                 default:
                     break;
             }
@@ -1795,6 +1800,7 @@ int corr_on_contribution(corr_engine_t* e,
             gs->merge_seen |= c->seen_mask;
             if (r->type == CORR_TEMPORAL) fired_now = eval_temporal(r, gs, NULL, 0, c->ts, window_start, &e->stats);
             break;
+        case CORR_CONTRIB_EVENT:
         default:
             break;
     }
@@ -1866,6 +1872,11 @@ int corr_contrib_kind_for(corr_type_t t) {
             return (int)CORR_CONTRIB_DISTINCT;
         case CORR_TEMPORAL:
             return (int)CORR_CONTRIB_SEEN;
+        case CORR_TEMPORAL_ORDERED:
+        case CORR_BEACONING:
+        case CORR_VALUE_PERCENTILE:
+        case CORR_VALUE_MEDIAN:
+        case CORR_TYPE__MAX:
         default:
             return -1;
     }

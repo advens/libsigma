@@ -44,6 +44,7 @@ static const char* kind_name(corr_contrib_kind_t k) {
             return "distinct";
         case CORR_CONTRIB_SEEN:
             return "seen";
+        case CORR_CONTRIB_EVENT:
         default:
             return NULL;
     }
