@@ -340,7 +340,7 @@ static inline void teddy_walk(const sigma_teddy_t* t,
  * whole key fits, so the 3-byte table is skipped in the last two bytes of the
  * text; the 2-byte table stays empty unless a caller built needles shorter than
  * the compiler's 3-byte minimum. */
-static inline void teddy_probe_at(const sigma_teddy_t* t,
+static __attribute__((unused)) void teddy_probe_at(const sigma_teddy_t* t,
                                   const char* buf,
                                   size_t len,
                                   size_t pos,
