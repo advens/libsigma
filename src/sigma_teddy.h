@@ -341,12 +341,12 @@ static inline void teddy_walk(const sigma_teddy_t* t,
  * text; the 2-byte table stays empty unless a caller built needles shorter than
  * the compiler's 3-byte minimum. */
 static __attribute__((unused)) void teddy_probe_at(const sigma_teddy_t* t,
-                                  const char* buf,
-                                  size_t len,
-                                  size_t pos,
-                                  sigma_teddy_scratch_t* scr,
-                                  teddy_mark_fn mark,
-                                  void* ctx) {
+                                                   const char* buf,
+                                                   size_t len,
+                                                   size_t pos,
+                                                   sigma_teddy_scratch_t* scr,
+                                                   teddy_mark_fn mark,
+                                                   void* ctx) {
     const size_t avail = len - pos;
     if (avail >= 3) {
         uint32_t h = teddy_hash(teddy_fp24((uint8_t)buf[pos], (uint8_t)buf[pos + 1], (uint8_t)buf[pos + 2]));
