@@ -10,6 +10,13 @@ is called out explicitly.
 
 ## [Unreleased]
 
+## [4.0.2] - 2026-11-10
+
+### Fixed
+
+- `teddy_probe_at`'s parameter list is aligned the way rsyslog's
+  clang-format expects. Whitespace only.
+
 ## [4.0.1] - 2026-11-10
 
 ### Fixed
@@ -124,7 +131,8 @@ First tagged release.
   the contribution codec; ASan/UBSan and TSan gates.
 - Normative on-disk format specification, `src/docs/SIGMAC_FORMAT.md`.
 
-[Unreleased]: https://github.com/advens/libsigma/compare/4.0.1...HEAD
+[Unreleased]: https://github.com/advens/libsigma/compare/4.0.2...HEAD
+[4.0.2]: https://github.com/advens/libsigma/releases/tag/4.0.2
 [4.0.1]: https://github.com/advens/libsigma/releases/tag/4.0.1
 [4.0.0]: https://github.com/advens/libsigma/releases/tag/4.0.0
 [3.0.1]: https://github.com/advens/libsigma/releases/tag/3.0.1
