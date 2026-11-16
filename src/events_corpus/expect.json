@@ -1,0 +1,7 @@
+{
+  "fires": [
+    {"event": 2, "corr_id": "chain", "group_field": "host.name", "group_value": "ws1"},
+    {"event": 5, "corr_id": "brute", "group_field": "source.ip", "group_value": "203.0.113.9"},
+    {"event": 5, "corr_id": "spray", "group_field": "source.ip", "group_value": "203.0.113.9"}
+  ]
+}

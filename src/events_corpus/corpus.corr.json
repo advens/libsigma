@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "correlations": [
+    {
+      "id": "brute",
+      "title": "Three external failures from one source",
+      "type": "event_count",
+      "base_rule_ids": [20],
+      "group_by": ["source.ip"],
+      "timespan_s": 120,
+      "condition": {"op": "gte", "count": 3},
+      "mitre": "T1110",
+      "level": "high"
+    },
+    {
+      "id": "spray",
+      "title": "Three users failing from one source",
+      "type": "value_count",
+      "base_rule_ids": [20],
+      "group_by": ["source.ip"],
+      "timespan_s": 300,
+      "condition": {"op": "gte", "count": 3, "field": "user.name"},
+      "mitre": "T1110.003",
+      "level": "high"
+    },
+    {
+      "id": "chain",
+      "title": "Encoded PowerShell, then a command naming the user",
+      "type": "temporal",
+      "base_rule_ids": [10, 70],
+      "group_by": ["host.name"],
+      "timespan_s": 600,
+      "condition": {"op": "gte", "count": 2},
+      "mitre": null,
+      "level": "medium"
+    }
+  ]
+}
