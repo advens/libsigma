@@ -5,6 +5,7 @@
 # <dest>/wasi-sdk          wasi-sdk (clang, wasm-ld, sysroot)
 # <dest>/wasmtime/wasmtime test runner (absent on hosts without a pin)
 # <dest>/include, lib      PCRE2 (8-bit, no JIT) and libfastjson, static
+# <dest>/share/licenses    notices for the code linked into wasm32 output
 # <dest>/.pins             written last; make rebuilds when the pins change
 #
 # Every download is checked against the sha256 below before it is
@@ -19,6 +20,14 @@ PCRE2_VER=10.49
 PCRE2_SHA256=929f0b20e62879252a15886b06c89f1edef61a363cbd5826fb041080a5e557ae
 LIBFASTJSON_VER=1.2304.0
 LIBFASTJSON_SHA256=ef30d1e57a18ec770f90056aaac77300270c6203bbe476f4181cc83a2d5dc80c
+# The wasi-libc commit wasi-sdk 34 builds its sysroot from. The release
+# tarball carries no license files; these are the ones that apply to the
+# libc code linked into every module.
+WASI_LIBC_COMMIT=2e6fb9d8ee0cdf9e431fbcabe8af3115de000a13
+WASI_LIBC_NOTICES="LICENSE:2711a8b5a5cdfef0e639f96c1aca12ae23d7d64a02d0507f1bdf14d2b27bbc3a
+LICENSE-MIT:23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3
+libc-top-half/musl/COPYRIGHT:b870108ec5e7790e9f9919064f1b9421d62d5f9b0e6c230c6adf7ea2da62e97b
+libc-bottom-half/cloudlibc/LICENSE:c8b789cf5a746611e6300a0cc7750dbf92b61912a709d04e639245f7290656d0"
 
 usage() {
     echo "usage: $0 <dest>" >&2
@@ -70,6 +79,7 @@ esac
 
 PINS="wasi-sdk=$WASI_SDK_REL/$sdk_sha wasmtime=$WASMTIME_VER/${wt_sha:-none}"
 PINS="$PINS pcre2=$PCRE2_VER/$PCRE2_SHA256 libfastjson=$LIBFASTJSON_VER/$LIBFASTJSON_SHA256"
+PINS="$PINS wasi-libc=$WASI_LIBC_COMMIT"
 if [ -f "$DEST/.pins" ] && [ "$(cat "$DEST/.pins")" = "$PINS" ]; then
     exit 0
 fi
@@ -130,7 +140,9 @@ fi
 # clang runs any wasm-opt found in PATH when it links. Configure and
 # CMake link test programs, so turn it off for them as well.
 WCC="$SDK/bin/clang --target=wasm32-wasip1 --sysroot=$SDK/share/wasi-sysroot"
-rm -rf "${DEST:?}/include" "${DEST:?}/lib"
+rm -rf "${DEST:?}/include" "${DEST:?}/lib" "${DEST:?}/share/licenses"
+LIC=$DEST/share/licenses
+mkdir -p "$LIC/pcre2" "$LIC/libfastjson" "$LIC/wasi-libc"
 
 # PCRE2: 8-bit only. JIT does not exist on wasm32; the interpreter runs.
 pcre2_tgz=pcre2-$PCRE2_VER.tar.gz
@@ -152,6 +164,7 @@ cmake -S "$WORK/pcre2-$PCRE2_VER" -B "$WORK/pcre2-build" \
 cmake --build "$WORK/pcre2-build" -j "$JOBS" >"$WORK/pcre2-build.log" 2>&1 \
     || { tail -30 "$WORK/pcre2-build.log" >&2; die "pcre2 build failed"; }
 cmake --install "$WORK/pcre2-build" >/dev/null
+cp "$WORK/pcre2-$PCRE2_VER/LICENCE.md" "$LIC/pcre2/LICENCE.md"
 
 # libfastjson. Its config.sub predates wasip1; the compiler carries the
 # real target, the host triple only selects cross-compilation.
@@ -169,8 +182,19 @@ tar -xzf "$DL/$lfj_tgz" -C "$WORK"
         || { tail -30 "$WORK/lfj-build.log" >&2; exit 1; }
     "$MAKE" install >/dev/null 2>&1
 ) || die "libfastjson build failed"
+cp "$WORK/libfastjson-$LIBFASTJSON_VER/COPYING" "$LIC/libfastjson/COPYING"
 
-for f in lib/libpcre2-8.a lib/libfastjson.a include/pcre2.h include/libfastjson/json.h; do
+# wasi-libc notices, one pinned file each.
+printf '%s\n' "$WASI_LIBC_NOTICES" | while IFS=: read -r path sha; do
+    name=$(printf '%s' "$path" | tr / -)
+    fetch "https://raw.githubusercontent.com/WebAssembly/wasi-libc/$WASI_LIBC_COMMIT/$path" \
+        "$sha" "wasi-libc-$name"
+    cp "$DL/wasi-libc-$name" "$LIC/wasi-libc/$name"
+done
+
+for f in lib/libpcre2-8.a lib/libfastjson.a include/pcre2.h include/libfastjson/json.h \
+    share/licenses/pcre2/LICENCE.md share/licenses/libfastjson/COPYING \
+    share/licenses/wasi-libc/LICENSE-MIT; do
     [ -f "$DEST/$f" ] || die "missing after build: $f"
 done
 

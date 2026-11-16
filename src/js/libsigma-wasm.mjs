@@ -119,7 +119,12 @@ async function toModule(source) {
     if (WebAssembly.compileStreaming) return WebAssembly.compileStreaming(source);
     return WebAssembly.compile(await source.arrayBuffer());
   }
-  if (source instanceof ArrayBuffer || ArrayBuffer.isView(source)) return WebAssembly.compile(source);
+  if (source instanceof ArrayBuffer) return WebAssembly.compile(source);
+  if (ArrayBuffer.isView(source)) {
+    // WebAssembly.compile refuses a view of a SharedArrayBuffer.
+    const view = new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
+    return WebAssembly.compile(source.buffer instanceof ArrayBuffer ? view : view.slice());
+  }
   if (source && typeof source.then === "function") return toModule(await source);
   throw new TypeError("source must be a WebAssembly.Module, a BufferSource, or a Response");
 }

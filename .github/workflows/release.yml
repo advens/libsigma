@@ -47,3 +47,42 @@ jobs:
           files: |
             libsigma-*.tar.gz
             libsigma-*.tar.gz.sha256
+
+  # The wasm32 assets join the release the job above published. The native
+  # tarball does not wait for them: a failure here leaves it published.
+  wasm:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libpcre2-dev libjson-c-dev pkg-config cmake
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: build and test
+        run: |
+          make wasm
+          make wasm-test
+          make wasm-san
+
+      - name: package
+        run: |
+          make wasm-dist
+          v="${GITHUB_REF_NAME}"
+          for f in "libsigma-wasm-${v}.tar.gz" "libsigma-wasm-sdk-${v}.tar.gz"; do
+            test -f "build/wasm/dist/$f" || { echo "no $f: Makefile version and tag differ"; exit 1; }
+          done
+          cd build/wasm/dist && sha256sum -c ./*.sha256
+
+      - name: publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/wasm/dist/libsigma-wasm-*.tar.gz
+            build/wasm/dist/libsigma-wasm-*.tar.gz.sha256
