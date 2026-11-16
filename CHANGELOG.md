@@ -10,6 +10,43 @@ is called out explicitly.
 
 ## [Unreleased]
 
+## [4.1.0] - 2026-11-16
+
+MINOR: new functionality beside the C library. The C ABI, the SONAME
+(`libsigma.so.4`), the `.sigmac` format (5, loads 4), and the contrib wire
+are unchanged; the native library is built from the same sources as 4.0.2.
+
+### Added
+
+- A JSON front end, `src/sigma_events.{c,h}`: match JSON or JSON Lines
+  events against a loaded `.sigmac`, explain one rule against one event
+  predicate by predicate, and run `rules.corr.json` correlations over a
+  sequence of events. Answers are JSON (schema 1, documented in the
+  header). It is not part of `libsigma.so` or the installed headers.
+- `libsigma.wasm`, a WASI reactor that exports the front end (ABI 1),
+  with a dependency-free JS loader for browsers, Web Workers, and Node
+  18+, a worker and its client so matching runs off the page's thread,
+  and TypeScript typings.
+- A wasm32-wasip1 build from the git tree: `make wasm`, `make wasm-test`
+  (the engine tests and the conformance check under wasmtime, the JS
+  tests under Node), and `make wasm-san` (UBSan in trap mode).
+  `scripts/wasm-deps.sh` fetches wasi-sdk 34, wasmtime, PCRE2, and
+  libfastjson, each checked against a pinned sha256.
+- Release assets `libsigma-wasm-<v>.tar.gz` (the module, loader, worker,
+  typings, `abi.json`) and `libsigma-wasm-sdk-<v>.tar.gz` (wasm32 static
+  libraries and headers), built by `make wasm-dist`, with the license
+  notices of the code linked into them.
+- An events corpus with expected hits written by hand and a golden
+  transcript that the native build, the wasm32 build, and the JS loader
+  each reproduce byte for byte (`make test-events`), plus
+  `make test-events-san` and the `fuzz_events` libFuzzer target.
+
+### CI
+
+- `wasm` on x86_64 and arm64, `wasm-same-bytes` (both hosts build the
+  same module), and `codestyle` (clang-format 18 with rsyslog's
+  `.clang-format` over `src/`, `sigma_cli.c` excepted).
+
 ## [4.0.2] - 2026-11-10
 
 ### Fixed
@@ -131,7 +168,8 @@ First tagged release.
   the contribution codec; ASan/UBSan and TSan gates.
 - Normative on-disk format specification, `src/docs/SIGMAC_FORMAT.md`.
 
-[Unreleased]: https://github.com/advens/libsigma/compare/4.0.2...HEAD
+[Unreleased]: https://github.com/advens/libsigma/compare/4.1.0...HEAD
+[4.1.0]: https://github.com/advens/libsigma/releases/tag/4.1.0
 [4.0.2]: https://github.com/advens/libsigma/releases/tag/4.0.2
 [4.0.1]: https://github.com/advens/libsigma/releases/tag/4.0.1
 [4.0.0]: https://github.com/advens/libsigma/releases/tag/4.0.0
