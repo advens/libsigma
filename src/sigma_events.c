@@ -214,8 +214,8 @@ static const sigma_rule_t* rule_by_id(const sigma_events_t* se, uint32_t rule_id
     return NULL;
 }
 
-static int pool_str(const sigma_db_t* db, const sigma_str_t* tab, uint32_t n, uint32_t id, const char** s,
-                    size_t* len) {
+static int pool_str(
+    const sigma_db_t* db, const sigma_str_t* tab, uint32_t n, uint32_t id, const char** s, size_t* len) {
     if (tab == NULL || id == SIGMA_NO_VALUE || id >= n) return 0;
     if (tab[id].off > db->strpool_len || tab[id].len > db->strpool_len - tab[id].off) return 0;
     *s = db->strpool + tab[id].off;
@@ -631,8 +631,7 @@ char* sigma_events_info_json(const sigma_events_t* se) {
     sb_t b = {0};
     sb_fmt(&b, "{\"ok\":true,\"schema\":%u,\"format_version\":%u,\"format_version_min\":%u,", SIGMA_EVENTS_SCHEMA,
            SIGMA_FORMAT_VERSION, SIGMA_FORMAT_VERSION_MIN);
-    sb_fmt(&b, "\"n_rules\":%u,\"re_skipped\":%u,\"rules\":[", (unsigned)se->db.n_rules,
-           (unsigned)se->db.n_re_skipped);
+    sb_fmt(&b, "\"n_rules\":%u,\"re_skipped\":%u,\"rules\":[", (unsigned)se->db.n_rules, (unsigned)se->db.n_re_skipped);
     for (uint32_t i = 0; i < se->db.n_rules; i++) {
         if (i) sb_lit(&b, ",");
         sb_rule_head(&b, &se->db, &se->db.rules[i]);
@@ -768,8 +767,7 @@ static void sb_operand(sb_t* b, const sigma_db_t* db, const sigma_pred_t* p) {
     }
 }
 
-static void sb_pred(
-    sb_t* b, sigma_events_t* se, struct json_object* ev, const sigma_rule_t* r, uint32_t pred_idx) {
+static void sb_pred(sb_t* b, sigma_events_t* se, struct json_object* ev, const sigma_rule_t* r, uint32_t pred_idx) {
     const sigma_db_t* db = &se->db;
     const sigma_pred_t* p = &db->preds[pred_idx];
     const char* fname = NULL;
@@ -963,8 +961,7 @@ char* sigma_events_correlate_json(
         out = err_json(msg);
         goto done;
     }
-    sb_fmt(&b, "{\"ok\":true,\"n_events\":%zu,\"n_correlations\":%zu,\"fires\":[", evs.n,
-           corr_engine_rule_count(ce));
+    sb_fmt(&b, "{\"ok\":true,\"n_events\":%zu,\"n_correlations\":%zu,\"fires\":[", evs.n, corr_engine_rule_count(ce));
     for (size_t i = 0; i < evs.n && !b.failed; i++) {
         double t;
         if (ev_time(evs.ev[i], now, &t))

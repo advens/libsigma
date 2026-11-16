@@ -203,8 +203,9 @@ static void test_input_forms(sigma_events_t* se) {
     check(fired_mask(m, 0) == B(600) && fired_mask(m, 1) == B(300), "JSON Lines: per-event hits");
     if (m) json_object_put(m);
 
-    const char* pretty = "{\n  \"source\": {\n    \"ip\": \"10.0.0.1\"\n  }\n}\n{\n  \"user.name\": \"a\",\n"
-                         "  \"user.target\": \"a\"\n}\n";
+    const char* pretty =
+        "{\n  \"source\": {\n    \"ip\": \"10.0.0.1\"\n  }\n}\n{\n  \"user.name\": \"a\",\n"
+        "  \"user.target\": \"a\"\n}\n";
     m = answer(sigma_events_match_json(se, pretty, strlen(pretty)));
     check(is_ok(m) && get_int(m, "n_events") == 2, "pretty-printed objects: 2 events");
     check(fired_mask(m, 1) == B(800), "pretty-printed objects: second event");

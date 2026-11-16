@@ -49,9 +49,9 @@
 #define SIGMA_WASM_ERR_FULL (-100)
 
 #if defined(__wasm__)
-#define WASM_EXPORT(name) __attribute__((export_name(name)))
+    #define WASM_EXPORT(name) __attribute__((export_name(name)))
 #else
-#define WASM_EXPORT(name)
+    #define WASM_EXPORT(name)
 #endif
 
 static sigma_events_t* g_engines[SIGMA_WASM_MAX_ENGINES];
