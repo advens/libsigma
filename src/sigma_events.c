@@ -930,14 +930,8 @@ char* sigma_events_correlate_json(
     if (se == NULL) return err_json("no engine");
     if (corr_json == NULL || corr_len == 0) return err_json("no correlation artifact");
 
-    /* corr_artifact_parse reads up to a NUL, not corr_len. */
-    char* cj = malloc(corr_len + 1);
-    if (cj == NULL) return NULL;
-    memcpy(cj, corr_json, corr_len);
-    cj[corr_len] = '\0';
     struct corr_artifact_view view;
-    corr_artifact_t* art = corr_artifact_parse(cj, corr_len, &view);
-    free(cj);
+    corr_artifact_t* art = corr_artifact_parse(corr_json, corr_len, &view);
     if (art == NULL) return err_json("correlation artifact rejected");
 
     corr_caps_t caps = corr_caps_default();

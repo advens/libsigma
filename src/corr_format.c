@@ -26,6 +26,7 @@
 
 #include "corr_format.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -370,11 +371,21 @@ corr_artifact_t* corr_artifact_parse(const char* json, size_t len, struct corr_a
         out_view->n = 0;
         memset(&out_view->load, 0, sizeof(out_view->load));
     }
-    if (json == NULL) return NULL;
-    (void)len; /* json-c parses a NUL-terminated string */
+    if (json == NULL || len == 0 || len > (size_t)INT_MAX) return NULL;
 
-    struct json_object* root = json_tokener_parse(json);
+    /* Exactly len bytes: the buffer need not be NUL-terminated. Only
+     * whitespace may follow the document. */
+    struct json_tokener* tok = json_tokener_new();
+    if (tok == NULL) return NULL;
+    struct json_object* root = json_tokener_parse_ex(tok, json, (int)len);
+    size_t end = root ? (size_t)tok->char_offset : 0;
+    json_tokener_free(tok);
     if (root == NULL) return NULL;
+    while (end < len && (json[end] == ' ' || json[end] == '\t' || json[end] == '\n' || json[end] == '\r')) end++;
+    if (end != len) {
+        json_object_put(root);
+        return NULL;
+    }
 
     /* Frozen artifact: object with version==1 and a correlations array.
      * A bare list or a missing/wrong version is a reject (NULL), not a

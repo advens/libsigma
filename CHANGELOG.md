@@ -10,6 +10,16 @@ is called out explicitly.
 
 ## [Unreleased]
 
+### Security
+
+- `corr_artifact_parse(json, len, view)` ignored `len` and read up to a NUL,
+  so a buffer without a terminator was read past its end. It now parses
+  exactly `len` bytes and needs no NUL. A document followed by anything but
+  whitespace, `len` 0, and `len` above `INT_MAX` are rejected. The callers
+  in this tree (`corr_artifact_load_file`, `sigma_events`) always passed a
+  terminated buffer. A caller that passed `len` 0 with a terminated string
+  must now pass its length. New libFuzzer target `fuzz_corr`.
+
 ## [4.1.0] - 2026-11-16
 
 MINOR: new functionality beside the C library. The C ABI, the SONAME

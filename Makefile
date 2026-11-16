@@ -8,7 +8,7 @@
 #   make bench     corpus throughput harness (bench_corpus)
 #   make bench-simd  CONTAINS-heavy microbench (bench_sigma)
 #   make conformance reference emitter -> C loader/matcher, byte parity
-#   make libfuzz   libFuzzer load/match/contrib
+#   make libfuzz   libFuzzer load/match/contrib/events/corr
 #   make libfuzz-ci  libFuzzer CI smoke (45s each, ASan+UBSan)
 #   make diffuzz   C matcher vs an external reference evaluator (needs SIGMAC_SRC)
 #   make test-events JSON front end (sigma_events): unit test + events corpus vs golden.txt
@@ -261,7 +261,19 @@ libfuzz: $(BUILDDIR) $(BUILDDIR)/seed.sigmac $(BUILDDIR)/libsigma.a
 	$(FUZZ_EVENTS_BUILD)
 	$(FUZZ_EVENTS_ENV) $(BUILDDIR)/fuzz_events -runs=$(FUZZ_RUNS) -max_len=$(FUZZ_MAXLEN) \
 		-timeout=2 $(BUILDDIR)/corpus_events
-	@echo "libFuzzer: $(FUZZ_RUNS) runs x 4 targets OK"
+	$(FUZZ_CORR_BUILD)
+	@$(FUZZ_CORR_SEEDS)
+	ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 $(BUILDDIR)/fuzz_corr -runs=$(FUZZ_RUNS) \
+		-max_len=$(FUZZ_MAXLEN) -timeout=2 $(BUILDDIR)/corpus_corr
+	@echo "libFuzzer: $(FUZZ_RUNS) runs x 5 targets OK"
+
+# fuzz_corr: corr_artifact_parse on libFuzzer's unterminated buffer. Seeds
+# are the correlation artifacts in the tree.
+FUZZ_CORR_BUILD = $(FUZZ_CC) -std=c11 $(WARN) -O1 -g -fsanitize=fuzzer,address,undefined \
+	$(FUZZ_JSON_CFLAGS) $(SRCDIR)/fuzz_corr.c $(SRCDIR)/corr_format.c $(SRCDIR)/classify_corr.c \
+	$(FUZZ_JSON_LIBS) -lm -pthread -o $(BUILDDIR)/fuzz_corr
+FUZZ_CORR_SEEDS = rm -rf $(BUILDDIR)/corpus_corr && mkdir -p $(BUILDDIR)/corpus_corr && \
+	cp $(SRCDIR)/events_corpus/corpus.corr.json $(SRCDIR)/fuzz_corpus/arch/arch.corr.json $(BUILDDIR)/corpus_corr/
 
 # fuzz_events: the JSON front end over the events-corpus artifact. Seeds are
 # the corpus events, once per call (the first byte picks match, explain, or
@@ -328,7 +340,15 @@ libfuzz-ci: $(BUILDDIR)
 	else \
 		echo "skip fuzz_events: json.h not available on this runner"; \
 	fi
-	@echo "libFuzzer CI: load/match/contrib/events + fuzz_simd OK"
+	@if $(FUZZ_CORR_BUILD); then \
+		$(FUZZ_CORR_SEEDS) && \
+		ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
+		UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+		$(BUILDDIR)/fuzz_corr $(FUZZ_CI_FLAGS) $(BUILDDIR)/corpus_corr; \
+	else \
+		echo "skip fuzz_corr: json.h not available on this runner"; \
+	fi
+	@echo "libFuzzer CI: load/match/contrib/events/corr + fuzz_simd OK"
 
 diffuzz: cli
 	SIGMAC_SRC=$(SIGMAC_SRC) $(SIGMAC_PY) $(SRCDIR)/fuzz_diff.py --seed 1

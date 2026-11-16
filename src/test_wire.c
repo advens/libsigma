@@ -6,10 +6,16 @@
 #include "corr_format.h"
 
 #include <json.h>
+#include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int g_pass, g_fail;
+
+static corr_artifact_t* parse_str(const char* json, struct corr_artifact_view* view) {
+    return corr_artifact_parse(json, strlen(json), view);
+}
 
 static void check(int cond, const char* msg) {
     if (cond) {
@@ -83,27 +89,70 @@ int main(void) {
 
     {
         struct corr_artifact_view view;
-        corr_artifact_t* a = corr_artifact_parse("{\"version\":1,\"correlations\":[]}", 0, &view);
+        corr_artifact_t* a = parse_str("{\"version\":1,\"correlations\":[]}", &view);
         check(a != NULL && view.n == 0, "corr json version=1 empty accepted");
         corr_artifact_free(a);
     }
     {
         struct corr_artifact_view view;
-        corr_artifact_t* a = corr_artifact_parse("[]", 0, &view);
+        corr_artifact_t* a = parse_str("[]", &view);
         check(a == NULL, "corr json bare array rejected");
         corr_artifact_free(a);
     }
     {
         struct corr_artifact_view view;
-        corr_artifact_t* a = corr_artifact_parse("{\"correlations\":[]}", 0, &view);
+        corr_artifact_t* a = parse_str("{\"correlations\":[]}", &view);
         check(a == NULL, "corr json missing version rejected");
         corr_artifact_free(a);
     }
     {
         struct corr_artifact_view view;
-        corr_artifact_t* a = corr_artifact_parse("{\"version\":2,\"correlations\":[]}", 0, &view);
+        corr_artifact_t* a = parse_str("{\"version\":2,\"correlations\":[]}", &view);
         check(a == NULL, "corr json version=2 rejected");
         corr_artifact_free(a);
+    }
+
+    /* corr_artifact_parse reads exactly len bytes and needs no NUL. */
+    {
+        static const char doc[] =
+            "{\"version\":1,\"correlations\":[{\"id\":\"c1\",\"type\":\"event_count\","
+            "\"base_rule_ids\":[10],\"group_by\":[\"host.name\"],\"timespan_s\":60,\"threshold\":2}]}";
+        size_t n = sizeof(doc) - 1;
+        char* buf = malloc(n); /* no room for a NUL: ASan flags any read past n */
+        check(buf != NULL, "corr exact-length buffer allocated");
+        if (buf != NULL) {
+            struct corr_artifact_view view;
+            memcpy(buf, doc, n);
+            corr_artifact_t* a = corr_artifact_parse(buf, n, &view);
+            check(a != NULL && view.n == 1, "corr json parsed from an unterminated buffer");
+            corr_artifact_free(a);
+            a = corr_artifact_parse(buf, n - 1, &view);
+            check(a == NULL, "corr json cut one byte short rejected");
+            corr_artifact_free(a);
+            free(buf);
+        }
+    }
+    {
+        struct corr_artifact_view view;
+        const char* ws = "{\"version\":1,\"correlations\":[]}\r\n\t \n";
+        corr_artifact_t* a = corr_artifact_parse(ws, strlen(ws), &view);
+        check(a != NULL && view.n == 0, "corr json trailing whitespace accepted");
+        corr_artifact_free(a);
+        const char* junk = "{\"version\":1,\"correlations\":[]}x";
+        a = corr_artifact_parse(junk, strlen(junk), &view);
+        check(a == NULL, "corr json trailing data rejected");
+        corr_artifact_free(a);
+        const char nul[] = "{\"version\":1,\"correlations\":[]}\0{}";
+        a = corr_artifact_parse(nul, sizeof(nul) - 1, &view);
+        check(a == NULL, "corr json embedded NUL then data rejected");
+        corr_artifact_free(a);
+        const char* body = "{\"version\":1,\"correlations\":[]}";
+        a = corr_artifact_parse(body, strlen(body) - 5, &view);
+        check(a == NULL, "corr json prefix of a document rejected");
+        corr_artifact_free(a);
+        check(corr_artifact_parse(body, 0, &view) == NULL && view.n == 0, "corr json len 0 rejected");
+        check(corr_artifact_parse(NULL, 10, &view) == NULL, "corr json NULL rejected");
+        check(corr_artifact_parse(body, (size_t)INT_MAX + 1, &view) == NULL, "corr json len > INT_MAX rejected");
     }
 
     printf("\nwire/version: %d passed, %d failed\n", g_pass, g_fail);
