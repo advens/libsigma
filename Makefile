@@ -11,6 +11,8 @@
 #   make libfuzz   libFuzzer load/match/contrib
 #   make libfuzz-ci  libFuzzer CI smoke (45s each, ASan+UBSan)
 #   make diffuzz   C matcher vs an external reference evaluator (needs SIGMAC_SRC)
+#   make wasm      wasm32-wasip1 static library + sigma_cli.wasm (git tree only)
+#   make wasm-test engine tests, conformance, and the NEON golden under wasmtime
 #   make install   PREFIX (default /usr/local)
 #   make clean
 
@@ -109,7 +111,7 @@ FUZZ_JSON_LIBS   ?= $(shell pkg-config --libs json-c 2>/dev/null || echo $(JSON_
 SIGMAC_SRC ?=
 SIGMAC_PY  ?= python3
 
-.PHONY: all test san tsan cli bench bench-simd fuzz libfuzz libfuzz-ci diffuzz diffuzz-arch diffuzz-c-arch conformance install clean
+.PHONY: all test san tsan cli bench bench-simd fuzz libfuzz libfuzz-ci diffuzz diffuzz-arch diffuzz-c-arch conformance wasm wasm-deps wasm-test install clean
 
 all: $(BUILDDIR)/$(SHLIB) $(BUILDDIR)/libsigma.a $(BUILDDIR)/sigma_cli sigma.pc
 
@@ -323,12 +325,104 @@ diffuzz-c-arch: $(BUILDDIR)/sigma_cli $(BUILDDIR)/sigma_cli_scalar
 	diff -u $(ARCH_FIX)/arch.dump $(BUILDDIR)/arch-native.txt
 	@echo "diffuzz-c-arch: native == scalar == NEON golden (matcher + corr)"
 
+# One event per conformance rule. Native and wasm check the same lines and ids.
+CONF_EVENTS := process.command_line=powershell -enc ZZ\nprocess.name=C:\\tools\\MiMiKatz.exe\ndestination.port=8443\nsource.ip=10.5.6.7\nnetwork.info=connect to port 443 now\nuser.name=alice\tuser.target=alice\n
+CONF_RULES  := 100 200 300 600 700 800
+
 conformance: cli
 	@SIGMAC_SRC=$(SIGMAC_SRC) $(SIGMAC_PY) $(SRCDIR)/conformance_emit.py $(BUILDDIR)/conf.sigmac
-	@printf 'process.command_line=powershell -enc ZZ\nprocess.name=C:\\tools\\MiMiKatz.exe\ndestination.port=8443\nsource.ip=10.5.6.7\nnetwork.info=connect to port 443 now\nuser.name=alice\tuser.target=alice\n' > $(BUILDDIR)/conf_ev.tsv
+	@printf '$(CONF_EVENTS)' > $(BUILDDIR)/conf_ev.tsv
 	@out=$$($(BUILDDIR)/sigma_cli $(BUILDDIR)/conf.sigmac < $(BUILDDIR)/conf_ev.tsv); echo "$$out"; \
-	 for r in 100 200 300 600 700 800; do echo "$$out" | grep -q "rule=$$r" || { echo "CONFORMANCE FAIL: rule $$r did not fire"; exit 1; }; done; \
+	 for r in $(CONF_RULES); do echo "$$out" | grep -q "rule=$$r" || { echo "CONFORMANCE FAIL: rule $$r did not fire"; exit 1; }; done; \
 	 echo "CONFORMANCE OK: Python-emitted .sigmac loaded + matched by C sigma_cli (6/6 rules incl. fieldref)"
+
+# ---------------------------------------------------------------------------
+# wasm32-wasip1. Built from the git tree only: scripts/ is not in the release
+# tarball. Nothing here is a prerequisite of all, test, or install, and none
+# of these objects go into the native libsigma.
+#
+# WASM_DEPS, WASI_SDK, and WASMTIME can point at an existing tree.
+WASM_DIR    := $(BUILDDIR)/wasm
+WASM_DEPS   ?= $(WASM_DIR)/deps
+WASI_SDK    ?= $(WASM_DEPS)/wasi-sdk
+WASMTIME    ?= $(WASM_DEPS)/wasmtime/wasmtime
+WASM_PINS   := $(WASM_DEPS)/.pins
+WASM_CC     := $(WASI_SDK)/bin/clang --target=wasm32-wasip1 --sysroot=$(WASI_SDK)/share/wasi-sysroot
+WASM_AR     := $(WASI_SDK)/bin/llvm-ar
+# HARDEN is not applied: the stack protector and FORTIFY have no wasm32
+# implementation. The module sandbox bounds every access to linear memory;
+# ASan and UBSan cover the code inside it.
+WASM_CFLAGS := -std=c11 -D_POSIX_C_SOURCE=200809L $(WARN) $(OPT) \
+               -I$(WASM_DEPS)/include -I$(WASM_DEPS)/include/libfastjson
+# --no-wasm-opt: clang otherwise runs any wasm-opt found in PATH, and the
+# bytes would depend on the host. 1 MiB stack, 256 MiB memory ceiling.
+WASM_LDFLAGS := --no-wasm-opt -Wl,-z,stack-size=1048576 -Wl,--max-memory=268435456
+WASM_LIBS   := $(WASM_DEPS)/lib/libpcre2-8.a $(WASM_DEPS)/lib/libfastjson.a -lm
+WASM_OBJS   := $(patsubst $(SRCDIR)/%.c,$(WASM_DIR)/obj/%.o,$(LIB_SRCS))
+WASM_TESTS  := test_sigma_match test_classify test_event_time test_wire
+# wasmtime sees src/ (fixtures) and build/ (generated artifacts) at the
+# same relative paths the native targets use.
+WASM_RUN    = $(WASMTIME) run --dir $(SRCDIR)::$(SRCDIR) --dir $(BUILDDIR)::$(BUILDDIR)
+
+# The script exits at once when <deps>/.pins matches its pins, and rewrites
+# .pins only after a rebuild, so objects rebuild exactly when a pin changes.
+WASM_DEPS_SH := scripts/wasm-deps.sh
+WASM_NO_DEPS := $(WASM_DEPS_SH) is not in the release tarball; build wasm from the git tree
+
+wasm-deps:
+	@test -f $(WASM_DEPS_SH) || { echo "make wasm: $(WASM_NO_DEPS)" >&2; exit 1; }
+	@sh $(WASM_DEPS_SH) $(WASM_DEPS)
+
+$(WASM_PINS):
+	@test -f $(WASM_DEPS_SH) || { echo "make wasm: $(WASM_NO_DEPS)" >&2; exit 1; }
+	sh $(WASM_DEPS_SH) $(WASM_DEPS)
+
+$(WASM_DIR)/obj/%.o: $(SRCDIR)/%.c $(WASM_PINS)
+	@mkdir -p $(WASM_DIR)/obj
+	$(WASM_CC) $(WASM_CFLAGS) -MMD -MP -c -o $@ $<
+
+-include $(WASM_OBJS:.o=.d)
+
+$(WASM_DIR)/libsigma.a: $(WASM_OBJS)
+	$(WASM_AR) rcs $@ $(WASM_OBJS)
+
+$(WASM_DIR)/sigma_cli.wasm: $(SRCDIR)/sigma_cli.c $(WASM_DIR)/libsigma.a $(wildcard $(SRCDIR)/*.h)
+	$(WASM_CC) $(WASM_CFLAGS) $(WASM_LDFLAGS) -o $@ $(SRCDIR)/sigma_cli.c \
+		$(WASM_DIR)/libsigma.a $(WASM_LIBS)
+
+# test_sigma_match times its |re match-limit case with clock(), which WASI
+# only provides through the process-clock emulation library.
+$(WASM_DIR)/test_sigma_match.wasm: $(SRCDIR)/test_sigma_match.c $(WASM_DIR)/libsigma.a $(wildcard $(SRCDIR)/*.h)
+	$(WASM_CC) $(WASM_CFLAGS) -D_WASI_EMULATED_PROCESS_CLOCKS $(WASM_LDFLAGS) -o $@ $< \
+		$(WASM_DIR)/libsigma.a $(WASM_LIBS) -lwasi-emulated-process-clocks
+
+$(WASM_DIR)/test_%.wasm: $(SRCDIR)/test_%.c $(WASM_DIR)/libsigma.a $(wildcard $(SRCDIR)/*.h)
+	$(WASM_CC) $(WASM_CFLAGS) $(WASM_LDFLAGS) -o $@ $< $(WASM_DIR)/libsigma.a $(WASM_LIBS)
+
+wasm:
+	@$(MAKE) --no-print-directory wasm-deps
+	@$(MAKE) --no-print-directory $(WASM_DIR)/libsigma.a $(WASM_DIR)/sigma_cli.wasm
+
+# fuzz_simd is native only: wasm32 has no vector path to compare with scalar.
+# test_corr_concurrency is native only: wasm32-wasip1 has no threads.
+wasm-test: wasm
+	@$(MAKE) --no-print-directory $(patsubst %,$(WASM_DIR)/%.wasm,$(WASM_TESTS))
+	@test -x $(WASMTIME) || { echo "wasm-test: no wasmtime at $(WASMTIME); pass WASMTIME="; exit 1; }
+	@for t in $(WASM_TESTS); do \
+		echo "--- $$t.wasm"; \
+		$(WASM_RUN) $(WASM_DIR)/$$t.wasm || exit 1; \
+	done
+	@echo "--- conformance (sigma_cli.wasm)"
+	@SIGMAC_SRC=$(SIGMAC_SRC) $(SIGMAC_PY) $(SRCDIR)/conformance_emit.py $(WASM_DIR)/conf.sigmac
+	@printf '$(CONF_EVENTS)' > $(WASM_DIR)/conf_ev.tsv
+	@out=$$($(WASM_RUN) $(WASM_DIR)/sigma_cli.wasm $(WASM_DIR)/conf.sigmac < $(WASM_DIR)/conf_ev.tsv); echo "$$out"; \
+	 for r in $(CONF_RULES); do echo "$$out" | grep -q "rule=$$r" || { echo "WASM CONFORMANCE FAIL: rule $$r did not fire"; exit 1; }; done; \
+	 echo "WASM CONFORMANCE OK: 6/6 rules"
+	@echo "--- arch fixture (sigma_cli.wasm vs NEON golden)"
+	$(WASM_RUN) $(WASM_DIR)/sigma_cli.wasm $(ARCH_FIX)/arch.sigmac $(ARCH_FIX)/arch.corr.json \
+		< $(ARCH_FIX)/arch.tsv > $(WASM_DIR)/arch-wasm.txt
+	diff -u $(ARCH_FIX)/arch.dump $(WASM_DIR)/arch-wasm.txt
+	@echo "wasm-test: wasm32 == NEON golden (matcher + corr), all engine tests passed"
 
 install: all
 	install -d $(DESTDIR)$(PREFIX)/lib
