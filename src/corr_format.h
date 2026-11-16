@@ -69,10 +69,12 @@ struct corr_artifact_view {
     corr_load_stats_t load; /* load-time truncation/skip counters */
 };
 
-/* Parse a JSON blob (NUL-terminated). Returns a heap artifact on success (even
- * with zero rules, an empty/malformed correlation list yields n==0, NOT an
- * error: a missing artifact must never crash the pipeline), or NULL on OOM /
- * unparseable JSON.  *out_view receives the rule array (valid until free). */
+/* Parse the len bytes at json; no NUL terminator is needed or read. Returns a
+ * heap artifact on success (even with zero rules, an empty/malformed
+ * correlation list yields n==0, NOT an error: a missing artifact must never
+ * crash the pipeline), or NULL on OOM, len 0, len > INT_MAX, unparseable JSON,
+ * or anything but whitespace after the document.  *out_view receives the rule
+ * array (valid until free). */
 corr_artifact_t* corr_artifact_parse(const char* json, size_t len, struct corr_artifact_view* out_view);
 
 /* Read + parse the artifact at *path*.  Returns NULL when absent/unreadable
