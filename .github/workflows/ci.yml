@@ -87,3 +87,94 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq libpcre2-dev libjson-c-dev pkg-config
       - name: native vs scalar
         run: make diffuzz-c-arch
+
+  # src/ follows the .clang-format of rsyslog, which builds these sources
+  # into its tree. The style file is pinned by commit and sha256.
+  codestyle:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang-format-18
+      - name: clang-format 18, rsyslog style
+        env:
+          RSYSLOG_COMMIT: 4734a93f4a34c4321d55b58f46ca401abe791330
+          STYLE_SHA256: 3765d57c26dc2d5acef954a5b1df00da56b642054e1195f2f628ebec0dde60b9
+        run: |
+          set -eu
+          style="$RUNNER_TEMP/.clang-format"
+          curl -fsSL --proto '=https' -o "$style" \
+            "https://raw.githubusercontent.com/rsyslog/rsyslog/$RSYSLOG_COMMIT/.clang-format"
+          echo "$STYLE_SHA256  $style" | sha256sum -c -
+          fail=0
+          for f in src/*.c src/*.h; do
+            # sigma_cli.c keeps column-aligned tables.
+            [ "$f" = src/sigma_cli.c ] && continue
+            clang-format-18 --style=file:"$style" --dry-run --Werror "$f" || fail=1
+          done
+          exit "$fail"
+
+  # wasm32-wasip1: the module, the engine tests under wasmtime, the events
+  # corpus against golden.txt (native and wasm), the JS loader under Node, and
+  # UBSan on wasm32. The toolchain is fetched and checked by wasm-deps.sh.
+  wasm:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libpcre2-dev libjson-c-dev pkg-config cmake
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: wasm toolchain cache
+        uses: actions/cache@v4
+        with:
+          path: build/wasm/deps
+          key: wasm-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/wasm-deps.sh') }}
+      - name: make wasm
+        run: make wasm
+      - name: make wasm-test
+        run: make wasm-test
+      - name: make wasm-san
+        run: make wasm-san
+      - name: make test-events
+        run: make test-events
+      - name: make test-events-san
+        run: make test-events-san
+      # Build the module again from a copy of the tree at another path, with
+      # the same toolchain: the bytes must not depend on the build directory.
+      - name: build twice
+        run: |
+          set -eu
+          again="$RUNNER_TEMP/again"
+          mkdir -p "$again"
+          tar --exclude=./build --exclude=./.git -cf - . | tar -xf - -C "$again"
+          make -C "$again" wasm WASM_DEPS="$PWD/build/wasm/deps" >/dev/null
+          for f in libsigma.wasm sigma_cli.wasm; do
+            cmp "build/wasm/$f" "$again/build/wasm/$f"
+          done
+          mkdir -p wasm-sum
+          sha256sum build/wasm/libsigma.wasm build/wasm/sigma_cli.wasm | tee wasm-sum/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasm-sum-${{ runner.arch }}
+          path: wasm-sum/SHA256SUMS
+
+  # x86_64 and arm64 hosts run different wasi-sdk binaries; the module they
+  # build must be the same bytes.
+  wasm-same-bytes:
+    needs: wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wasm-sum-*
+      - name: compare
+        run: |
+          set -eu
+          cat wasm-sum-X64/SHA256SUMS
+          diff -u wasm-sum-X64/SHA256SUMS wasm-sum-ARM64/SHA256SUMS

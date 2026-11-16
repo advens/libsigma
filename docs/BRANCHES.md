@@ -6,7 +6,7 @@ branch that dies at merge.
 ## main
 
 - CI on `main` is green (`commit-msg`, `test`, `san`, `tsan`,
-  `diffuzz-arch`).
+  `diffuzz-arch`, `codestyle`, `wasm`, `wasm-same-bytes`).
 - No merge commits. Squash or rebase only.
 - Squash uses the PR title as the subject and the PR body as Why / Proof /
   Contract (`docs/COMMIT.md`).
