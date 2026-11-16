@@ -68,6 +68,13 @@ Pushing the tag fires `.github/workflows/release.yml`:
    release notes body (falls back to "See CHANGELOG.md." if that
    heading is missing, which is why step 3 above is not optional).
 4. A GitHub Release named `<tag>` is published with both files attached.
+5. A second job builds the wasm32 assets from the same commit, runs
+   `make wasm-test` and `make wasm-san`, and attaches
+   `libsigma-wasm-<tag>.tar.gz` (the module, its JS loader and worker,
+   typings, `abi.json`) and `libsigma-wasm-sdk-<tag>.tar.gz` (wasm32
+   static libraries and headers), each with a `.sha256`. It starts after
+   step 4, so a wasm failure never holds back the native tarball; rerun
+   the job once the cause is fixed.
 
 No local packaging step, no manual upload: the tag push is the only
 trigger.
@@ -80,3 +87,17 @@ sha256sum -c libsigma-<tag>.tar.gz.sha256
 tar xzf libsigma-<tag>.tar.gz
 cd libsigma-<tag> && make test && make conformance
 ```
+
+The wasm assets carry a `SHA256SUMS` inside as well:
+
+```
+gh release download <tag> -p 'libsigma-wasm-*'
+sha256sum -c libsigma-wasm-<tag>.tar.gz.sha256 libsigma-wasm-sdk-<tag>.tar.gz.sha256
+tar xzf libsigma-wasm-<tag>.tar.gz
+cd libsigma-wasm-<tag> && sha256sum -c SHA256SUMS
+```
+
+`make wasm-dist` in a git checkout of the tag rebuilds both. The module
+bytes do not depend on the build host or directory (CI compares x86_64
+and arm64 builds), so `libsigma.wasm` and `abi.json` match the published
+ones.

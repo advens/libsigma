@@ -18,6 +18,8 @@
 #   make wasm-test engine tests, test_events, events corpus, conformance, NEON golden
 #                  under wasmtime, then the JS loader tests (node --test)
 #   make wasm-san  UBSan (trap mode) builds of the tests on wasm32
+#   make wasm-dist release tarballs: the module with its JS loader, and the
+#                  wasm32 SDK (static libraries and headers), in build/wasm/dist
 #   make install   PREFIX (default /usr/local)
 #   make clean
 
@@ -116,7 +118,7 @@ FUZZ_JSON_LIBS   ?= $(shell pkg-config --libs json-c 2>/dev/null || echo $(JSON_
 SIGMAC_SRC ?=
 SIGMAC_PY  ?= python3
 
-.PHONY: all test san tsan cli bench bench-simd fuzz libfuzz libfuzz-ci diffuzz diffuzz-arch diffuzz-c-arch conformance test-events test-events-san events-golden-update fuzz-events-seeds wasm wasm-deps wasm-test wasm-san install clean
+.PHONY: all test san tsan cli bench bench-simd fuzz libfuzz libfuzz-ci diffuzz diffuzz-arch diffuzz-c-arch conformance test-events test-events-san events-golden-update fuzz-events-seeds wasm wasm-deps wasm-test wasm-san wasm-dist install clean
 
 all: $(BUILDDIR)/$(SHLIB) $(BUILDDIR)/libsigma.a $(BUILDDIR)/sigma_cli sigma.pc
 
@@ -525,7 +527,7 @@ wasm-test: wasm
 	diff -u $(EVC)/golden.txt $(WASM_DIR)/golden.txt
 	@echo "--- JS loader (node --test, libsigma.wasm)"
 	LIBSIGMA_WASM=$(WASM_MODULE) CORPUS_SIGMAC=$(WASM_DIR)/corpus.sigmac \
-		$(NODE) --test $(SRCDIR)/js/libsigma-wasm.test.mjs
+		$(NODE) --test $(SRCDIR)/js/libsigma-wasm.test.mjs $(SRCDIR)/js/libsigma-wasm-remote.test.mjs
 	@echo "--- conformance (sigma_cli.wasm)"
 	@printf '$(CONF_EVENTS)' > $(WASM_DIR)/conf_ev.tsv
 	@out=$$($(WASM_RUN) $(WASM_DIR)/sigma_cli.wasm $(WASM_DIR)/conf.sigmac < $(WASM_DIR)/conf_ev.tsv); echo "$$out"; \
@@ -567,6 +569,21 @@ wasm-san: wasm
 	$(WASM_RUN) $(WASM_SAN_DIR)/events_golden.wasm $(WASM_DIR)/corpus.sigmac $(EVC_ARGS) \
 		| diff -u $(EVC)/golden.txt -
 	@echo "wasm-san: UBSan (trap) clean on wasm32, canary trapped, transcript == golden.txt"
+
+# Release assets (scripts/wasm-dist.mjs). The tar streams depend only on the
+# inputs; SOURCE_DATE_EPOCH dates every entry (default: the last commit).
+WASM_DIST_DIR     := $(WASM_DIR)/dist
+SOURCE_DATE_EPOCH ?= $(shell git log -1 --format=%ct 2>/dev/null || echo 0)
+
+$(WASM_DIR)/libsigma_events.a: $(WASM_DIR)/obj/sigma_events.o
+	$(WASM_AR) rcs $@ $<
+
+wasm-dist: wasm
+	@$(MAKE) --no-print-directory $(WASM_DIR)/libsigma_events.a
+	@command -v $(NODE) >/dev/null 2>&1 || { echo "wasm-dist: $(NODE) not found; pass NODE="; exit 1; }
+	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(NODE) scripts/wasm-dist.mjs --out $(WASM_DIST_DIR) \
+		--version $(LIB_MAJOR).$(LIB_MINOR).$(LIB_PATCH) --wasm-dir $(WASM_DIR) --deps $(WASM_DEPS) \
+		--headers "$(HEADERS) $(SRCDIR)/sigma_events.h"
 
 install: all
 	install -d $(DESTDIR)$(PREFIX)/lib

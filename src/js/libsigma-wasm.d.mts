@@ -96,14 +96,17 @@ export interface CorrelateAnswer {
 
 export type Events = string | Record<string, unknown> | Record<string, unknown>[];
 
+/** Bytes the loader copies: any view, including a Node Buffer. */
+export type Bytes = ArrayBuffer | ArrayBufferView;
+
 export declare class SigmaModule {
   static instantiate(
-    source: WebAssembly.Module | BufferSource | Response | Promise<Response>,
+    source: WebAssembly.Module | Bytes | Response | Promise<Response>,
     options?: { onOutput?: (stream: "stdout" | "stderr", text: string) => void },
   ): Promise<SigmaModule>;
   /** .sigmac format versions this module loads, inclusive. */
   readonly formatVersions: [number, number];
-  load(sigmac: BufferSource): SigmaEngine;
+  load(sigmac: Bytes): SigmaEngine;
 }
 
 export declare class SigmaEngine {
