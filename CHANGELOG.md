@@ -10,6 +10,11 @@ is called out explicitly.
 
 ## [Unreleased]
 
+## [4.1.1] - 2026-11-16
+
+PATCH: a bounds fix. The C ABI, the SONAME (`libsigma.so.4`), the `.sigmac`
+format, and the contrib wire are unchanged.
+
 ### Security
 
 - `corr_artifact_parse(json, len, view)` ignored `len` and read up to a NUL,
@@ -178,7 +183,8 @@ First tagged release.
   the contribution codec; ASan/UBSan and TSan gates.
 - Normative on-disk format specification, `src/docs/SIGMAC_FORMAT.md`.
 
-[Unreleased]: https://github.com/advens/libsigma/compare/4.1.0...HEAD
+[Unreleased]: https://github.com/advens/libsigma/compare/4.1.1...HEAD
+[4.1.1]: https://github.com/advens/libsigma/releases/tag/4.1.1
 [4.1.0]: https://github.com/advens/libsigma/releases/tag/4.1.0
 [4.0.2]: https://github.com/advens/libsigma/releases/tag/4.0.2
 [4.0.1]: https://github.com/advens/libsigma/releases/tag/4.0.1
