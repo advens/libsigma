@@ -11,8 +11,9 @@
 #   make libfuzz   libFuzzer load/match/contrib
 #   make libfuzz-ci  libFuzzer CI smoke (45s each, ASan+UBSan)
 #   make diffuzz   C matcher vs an external reference evaluator (needs SIGMAC_SRC)
-#   make wasm      wasm32-wasip1 static library + sigma_cli.wasm (git tree only)
-#   make wasm-test engine tests, conformance, and the NEON golden under wasmtime
+#   make test-events JSON front end (sigma_events) against the conformance artifact
+#   make wasm      wasm32-wasip1 library, sigma_cli.wasm, libsigma.wasm module (git tree only)
+#   make wasm-test engine tests, test_events, conformance, and the NEON golden under wasmtime
 #   make install   PREFIX (default /usr/local)
 #   make clean
 
@@ -111,7 +112,7 @@ FUZZ_JSON_LIBS   ?= $(shell pkg-config --libs json-c 2>/dev/null || echo $(JSON_
 SIGMAC_SRC ?=
 SIGMAC_PY  ?= python3
 
-.PHONY: all test san tsan cli bench bench-simd fuzz libfuzz libfuzz-ci diffuzz diffuzz-arch diffuzz-c-arch conformance wasm wasm-deps wasm-test install clean
+.PHONY: all test san tsan cli bench bench-simd fuzz libfuzz libfuzz-ci diffuzz diffuzz-arch diffuzz-c-arch conformance test-events wasm wasm-deps wasm-test install clean
 
 all: $(BUILDDIR)/$(SHLIB) $(BUILDDIR)/libsigma.a $(BUILDDIR)/sigma_cli sigma.pc
 
@@ -325,6 +326,15 @@ diffuzz-c-arch: $(BUILDDIR)/sigma_cli $(BUILDDIR)/sigma_cli_scalar
 	diff -u $(ARCH_FIX)/arch.dump $(BUILDDIR)/arch-native.txt
 	@echo "diffuzz-c-arch: native == scalar == NEON golden (matcher + corr)"
 
+# sigma_events.c is the JSON front end the wasm module exports. It is not in
+# LIB_SRCS: the native library does not change. The test compiles it in.
+$(BUILDDIR)/test_events: $(SRCDIR)/test_events.c $(SRCDIR)/sigma_events.c $(BUILDDIR)/libsigma.a $(wildcard $(SRCDIR)/*.h)
+	$(CC) $(CFLAGS) -o $@ $(SRCDIR)/test_events.c $(SRCDIR)/sigma_events.c $(BUILDDIR)/libsigma.a $(LIBS)
+
+test-events: $(BUILDDIR)/test_events
+	@SIGMAC_SRC=$(SIGMAC_SRC) $(SIGMAC_PY) $(SRCDIR)/conformance_emit.py $(BUILDDIR)/conf.sigmac
+	$(BUILDDIR)/test_events $(BUILDDIR)/conf.sigmac $(ARCH_FIX)/arch.sigmac $(ARCH_FIX)/arch.corr.json
+
 # One event per conformance rule. Native and wasm check the same lines and ids.
 CONF_EVENTS := process.command_line=powershell -enc ZZ\nprocess.name=C:\\tools\\MiMiKatz.exe\ndestination.port=8443\nsource.ip=10.5.6.7\nnetwork.info=connect to port 443 now\nuser.name=alice\tuser.target=alice\n
 CONF_RULES  := 100 200 300 600 700 800
@@ -399,21 +409,41 @@ $(WASM_DIR)/test_sigma_match.wasm: $(SRCDIR)/test_sigma_match.c $(WASM_DIR)/libs
 $(WASM_DIR)/test_%.wasm: $(SRCDIR)/test_%.c $(WASM_DIR)/libsigma.a $(wildcard $(SRCDIR)/*.h)
 	$(WASM_CC) $(WASM_CFLAGS) $(WASM_LDFLAGS) -o $@ $< $(WASM_DIR)/libsigma.a $(WASM_LIBS)
 
+# The module a WebAssembly host loads: a WASI reactor (no main) exporting
+# the sigma_wasm_* entry points of sigma_wasm.c over sigma_events.c.
+# --strip-all drops the function-name section (about 40% of the bytes);
+# exports keep their names.
+WASM_MODULE      := $(WASM_DIR)/libsigma.wasm
+WASM_MODULE_OBJS := $(WASM_DIR)/obj/sigma_wasm.o $(WASM_DIR)/obj/sigma_events.o
+
+-include $(WASM_MODULE_OBJS:.o=.d)
+
+$(WASM_MODULE): $(WASM_MODULE_OBJS) $(WASM_DIR)/libsigma.a
+	$(WASM_CC) $(WASM_CFLAGS) -mexec-model=reactor $(WASM_LDFLAGS) -Wl,--strip-all -o $@ \
+		$(WASM_MODULE_OBJS) $(WASM_DIR)/libsigma.a $(WASM_LIBS)
+
+$(WASM_DIR)/test_events.wasm: $(SRCDIR)/test_events.c $(WASM_DIR)/obj/sigma_events.o $(WASM_DIR)/libsigma.a $(wildcard $(SRCDIR)/*.h)
+	$(WASM_CC) $(WASM_CFLAGS) $(WASM_LDFLAGS) -o $@ $< $(WASM_DIR)/obj/sigma_events.o \
+		$(WASM_DIR)/libsigma.a $(WASM_LIBS)
+
 wasm:
 	@$(MAKE) --no-print-directory wasm-deps
-	@$(MAKE) --no-print-directory $(WASM_DIR)/libsigma.a $(WASM_DIR)/sigma_cli.wasm
+	@$(MAKE) --no-print-directory $(WASM_DIR)/libsigma.a $(WASM_DIR)/sigma_cli.wasm $(WASM_MODULE)
 
 # fuzz_simd is native only: wasm32 has no vector path to compare with scalar.
 # test_corr_concurrency is native only: wasm32-wasip1 has no threads.
 wasm-test: wasm
-	@$(MAKE) --no-print-directory $(patsubst %,$(WASM_DIR)/%.wasm,$(WASM_TESTS))
+	@$(MAKE) --no-print-directory $(patsubst %,$(WASM_DIR)/%.wasm,$(WASM_TESTS) test_events)
 	@test -x $(WASMTIME) || { echo "wasm-test: no wasmtime at $(WASMTIME); pass WASMTIME="; exit 1; }
 	@for t in $(WASM_TESTS); do \
 		echo "--- $$t.wasm"; \
 		$(WASM_RUN) $(WASM_DIR)/$$t.wasm || exit 1; \
 	done
-	@echo "--- conformance (sigma_cli.wasm)"
 	@SIGMAC_SRC=$(SIGMAC_SRC) $(SIGMAC_PY) $(SRCDIR)/conformance_emit.py $(WASM_DIR)/conf.sigmac
+	@echo "--- test_events.wasm"
+	$(WASM_RUN) $(WASM_DIR)/test_events.wasm $(WASM_DIR)/conf.sigmac \
+		$(ARCH_FIX)/arch.sigmac $(ARCH_FIX)/arch.corr.json
+	@echo "--- conformance (sigma_cli.wasm)"
 	@printf '$(CONF_EVENTS)' > $(WASM_DIR)/conf_ev.tsv
 	@out=$$($(WASM_RUN) $(WASM_DIR)/sigma_cli.wasm $(WASM_DIR)/conf.sigmac < $(WASM_DIR)/conf_ev.tsv); echo "$$out"; \
 	 for r in $(CONF_RULES); do echo "$$out" | grep -q "rule=$$r" || { echo "WASM CONFORMANCE FAIL: rule $$r did not fire"; exit 1; }; done; \
