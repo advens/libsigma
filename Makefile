@@ -11,9 +11,13 @@
 #   make libfuzz   libFuzzer load/match/contrib
 #   make libfuzz-ci  libFuzzer CI smoke (45s each, ASan+UBSan)
 #   make diffuzz   C matcher vs an external reference evaluator (needs SIGMAC_SRC)
-#   make test-events JSON front end (sigma_events) against the conformance artifact
+#   make test-events JSON front end (sigma_events): unit test + events corpus vs golden.txt
+#   make test-events-san  the same under ASan + UBSan
+#   make events-golden-update  rewrite src/events_corpus/golden.txt (review the diff)
 #   make wasm      wasm32-wasip1 library, sigma_cli.wasm, libsigma.wasm module (git tree only)
-#   make wasm-test engine tests, test_events, conformance, and the NEON golden under wasmtime
+#   make wasm-test engine tests, test_events, events corpus, conformance, NEON golden
+#                  under wasmtime, then the JS loader tests (node --test)
+#   make wasm-san  UBSan (trap mode) builds of the tests on wasm32
 #   make install   PREFIX (default /usr/local)
 #   make clean
 
@@ -112,7 +116,7 @@ FUZZ_JSON_LIBS   ?= $(shell pkg-config --libs json-c 2>/dev/null || echo $(JSON_
 SIGMAC_SRC ?=
 SIGMAC_PY  ?= python3
 
-.PHONY: all test san tsan cli bench bench-simd fuzz libfuzz libfuzz-ci diffuzz diffuzz-arch diffuzz-c-arch conformance test-events wasm wasm-deps wasm-test install clean
+.PHONY: all test san tsan cli bench bench-simd fuzz libfuzz libfuzz-ci diffuzz diffuzz-arch diffuzz-c-arch conformance test-events test-events-san events-golden-update fuzz-events-seeds wasm wasm-deps wasm-test wasm-san install clean
 
 all: $(BUILDDIR)/$(SHLIB) $(BUILDDIR)/libsigma.a $(BUILDDIR)/sigma_cli sigma.pc
 
@@ -251,7 +255,29 @@ libfuzz: $(BUILDDIR) $(BUILDDIR)/seed.sigmac $(BUILDDIR)/libsigma.a
 		-timeout=2
 	$(BUILDDIR)/fuzz_contrib -runs=$(FUZZ_RUNS) -max_len=$(FUZZ_MAXLEN) \
 		-timeout=2 $(SRCDIR)/fuzz_corpus/contrib
-	@echo "libFuzzer: $(FUZZ_RUNS) runs x 3 targets OK"
+	@$(MAKE) --no-print-directory fuzz-events-seeds
+	$(FUZZ_EVENTS_BUILD)
+	$(FUZZ_EVENTS_ENV) $(BUILDDIR)/fuzz_events -runs=$(FUZZ_RUNS) -max_len=$(FUZZ_MAXLEN) \
+		-timeout=2 $(BUILDDIR)/corpus_events
+	@echo "libFuzzer: $(FUZZ_RUNS) runs x 4 targets OK"
+
+# fuzz_events: the JSON front end over the events-corpus artifact. Seeds are
+# the corpus events, once per call (the first byte picks match, explain, or
+# correlate).
+FUZZ_EVENTS_BUILD = $(FUZZ_CC) -std=c11 $(WARN) -O1 -g -fsanitize=fuzzer,address,undefined -pthread \
+	$(PCRE2_CFLAGS) $(FUZZ_JSON_CFLAGS) $(SRCDIR)/fuzz_events.c $(SRCDIR)/sigma_events.c \
+	$(LIB_SRCS) $(PCRE2_LIBS) $(FUZZ_JSON_LIBS) -lm -o $(BUILDDIR)/fuzz_events
+FUZZ_EVENTS_ENV = SIGMA_EVENTS_FUZZ_SIGMAC=$(BUILDDIR)/corpus.sigmac \
+	SIGMA_EVENTS_FUZZ_CORR=$(SRCDIR)/events_corpus/corpus.corr.json \
+	ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1
+
+fuzz-events-seeds: $(BUILDDIR)/corpus.sigmac
+	@rm -rf $(BUILDDIR)/corpus_events
+	@mkdir -p $(BUILDDIR)/corpus_events
+	@i=0; while IFS= read -r line; do \
+		for op in 0 1 2; do printf "\\00$$op%s" "$$line" > $(BUILDDIR)/corpus_events/seed-$$i-$$op; done; \
+		i=$$((i + 1)); \
+	done < $(SRCDIR)/events_corpus/events.jsonl
 
 # Bounded libFuzzer smoke for GitLab. Wall clock 45s per libFuzzer target so
 # the parent validate stage stays a gate, not a campaign. fuzz_simd is the
@@ -294,7 +320,13 @@ libfuzz-ci: $(BUILDDIR)
 	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
 	UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 	$(BUILDDIR)/fuzz_simd_san
-	@echo "libFuzzer CI: load/match/contrib + fuzz_simd OK"
+	@if $(FUZZ_EVENTS_BUILD); then \
+		$(MAKE) --no-print-directory fuzz-events-seeds && \
+		$(FUZZ_EVENTS_ENV) $(BUILDDIR)/fuzz_events $(FUZZ_CI_FLAGS) $(BUILDDIR)/corpus_events; \
+	else \
+		echo "skip fuzz_events: json.h not available on this runner"; \
+	fi
+	@echo "libFuzzer CI: load/match/contrib/events + fuzz_simd OK"
 
 diffuzz: cli
 	SIGMAC_SRC=$(SIGMAC_SRC) $(SIGMAC_PY) $(SRCDIR)/fuzz_diff.py --seed 1
@@ -331,9 +363,43 @@ diffuzz-c-arch: $(BUILDDIR)/sigma_cli $(BUILDDIR)/sigma_cli_scalar
 $(BUILDDIR)/test_events: $(SRCDIR)/test_events.c $(SRCDIR)/sigma_events.c $(BUILDDIR)/libsigma.a $(wildcard $(SRCDIR)/*.h)
 	$(CC) $(CFLAGS) -o $@ $(SRCDIR)/test_events.c $(SRCDIR)/sigma_events.c $(BUILDDIR)/libsigma.a $(LIBS)
 
-test-events: $(BUILDDIR)/test_events
+# Events corpus: a generated artifact with routing buckets, hand-written truth
+# in events.jsonl and expect.json, and golden.txt, the transcript every build
+# of the front end (native, wasm32, the JS loader) must reproduce byte for byte.
+EVC       := $(SRCDIR)/events_corpus
+EVC_ARGS  := $(EVC)/corpus.corr.json $(EVC)/events.jsonl $(EVC)/expect.json
+EVC_GEN   := $(EVC)/gen_corpus.py $(SRCDIR)/reference/sigmac/format.py
+
+$(BUILDDIR)/corpus.sigmac: $(EVC_GEN) | $(BUILDDIR)
+	@SIGMAC_SRC=$(SIGMAC_SRC) $(SIGMAC_PY) $(EVC)/gen_corpus.py $@
+
+$(BUILDDIR)/events_golden: $(SRCDIR)/events_golden.c $(SRCDIR)/sigma_events.c $(BUILDDIR)/libsigma.a $(wildcard $(SRCDIR)/*.h)
+	$(CC) $(CFLAGS) -o $@ $(SRCDIR)/events_golden.c $(SRCDIR)/sigma_events.c $(BUILDDIR)/libsigma.a $(LIBS)
+
+test-events: $(BUILDDIR)/test_events $(BUILDDIR)/events_golden $(BUILDDIR)/corpus.sigmac
 	@SIGMAC_SRC=$(SIGMAC_SRC) $(SIGMAC_PY) $(SRCDIR)/conformance_emit.py $(BUILDDIR)/conf.sigmac
 	$(BUILDDIR)/test_events $(BUILDDIR)/conf.sigmac $(ARCH_FIX)/arch.sigmac $(ARCH_FIX)/arch.corr.json
+	$(BUILDDIR)/events_golden $(BUILDDIR)/corpus.sigmac $(EVC_ARGS) > $(BUILDDIR)/golden.txt
+	diff -u $(EVC)/golden.txt $(BUILDDIR)/golden.txt
+	@echo "events corpus: truth holds, native transcript == golden.txt"
+
+# Rewrite golden.txt from the native build after an intended change to an
+# answer. Review the diff before committing it.
+events-golden-update: $(BUILDDIR)/events_golden $(BUILDDIR)/corpus.sigmac
+	$(BUILDDIR)/events_golden $(BUILDDIR)/corpus.sigmac $(EVC_ARGS) > $(EVC)/golden.txt
+
+# ASan + UBSan over the front end, library sources compiled in (see san).
+test-events-san: $(BUILDDIR)/corpus.sigmac
+	@SIGMAC_SRC=$(SIGMAC_SRC) $(SIGMAC_PY) $(SRCDIR)/conformance_emit.py $(BUILDDIR)/conf.sigmac
+	$(CC) $(CFLAGS) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -pthread \
+		-o $(BUILDDIR)/test_events_san $(SRCDIR)/test_events.c $(SRCDIR)/sigma_events.c \
+		$(LIB_SRCS) $(LIBS)
+	$(CC) $(CFLAGS) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -pthread \
+		-o $(BUILDDIR)/events_golden_san $(SRCDIR)/events_golden.c $(SRCDIR)/sigma_events.c \
+		$(LIB_SRCS) $(LIBS)
+	$(BUILDDIR)/test_events_san $(BUILDDIR)/conf.sigmac $(ARCH_FIX)/arch.sigmac $(ARCH_FIX)/arch.corr.json
+	$(BUILDDIR)/events_golden_san $(BUILDDIR)/corpus.sigmac $(EVC_ARGS) | diff -u $(EVC)/golden.txt -
+	@echo "test-events-san: ASan + UBSan clean, transcript == golden.txt"
 
 # One event per conformance rule. Native and wasm check the same lines and ids.
 CONF_EVENTS := process.command_line=powershell -enc ZZ\nprocess.name=C:\\tools\\MiMiKatz.exe\ndestination.port=8443\nsource.ip=10.5.6.7\nnetwork.info=connect to port 443 now\nuser.name=alice\tuser.target=alice\n
@@ -426,15 +492,26 @@ $(WASM_DIR)/test_events.wasm: $(SRCDIR)/test_events.c $(WASM_DIR)/obj/sigma_even
 	$(WASM_CC) $(WASM_CFLAGS) $(WASM_LDFLAGS) -o $@ $< $(WASM_DIR)/obj/sigma_events.o \
 		$(WASM_DIR)/libsigma.a $(WASM_LIBS)
 
+$(WASM_DIR)/events_golden.wasm: $(SRCDIR)/events_golden.c $(WASM_DIR)/obj/sigma_events.o $(WASM_DIR)/libsigma.a $(wildcard $(SRCDIR)/*.h)
+	$(WASM_CC) $(WASM_CFLAGS) $(WASM_LDFLAGS) -o $@ $< $(WASM_DIR)/obj/sigma_events.o \
+		$(WASM_DIR)/libsigma.a $(WASM_LIBS)
+
+$(WASM_DIR)/corpus.sigmac: $(EVC_GEN) $(WASM_PINS)
+	@SIGMAC_SRC=$(SIGMAC_SRC) $(SIGMAC_PY) $(EVC)/gen_corpus.py $@
+
 wasm:
 	@$(MAKE) --no-print-directory wasm-deps
 	@$(MAKE) --no-print-directory $(WASM_DIR)/libsigma.a $(WASM_DIR)/sigma_cli.wasm $(WASM_MODULE)
 
+NODE ?= node
+
 # fuzz_simd is native only: wasm32 has no vector path to compare with scalar.
 # test_corr_concurrency is native only: wasm32-wasip1 has no threads.
 wasm-test: wasm
-	@$(MAKE) --no-print-directory $(patsubst %,$(WASM_DIR)/%.wasm,$(WASM_TESTS) test_events)
+	@$(MAKE) --no-print-directory $(patsubst %,$(WASM_DIR)/%.wasm,$(WASM_TESTS) test_events events_golden) \
+		$(WASM_DIR)/corpus.sigmac
 	@test -x $(WASMTIME) || { echo "wasm-test: no wasmtime at $(WASMTIME); pass WASMTIME="; exit 1; }
+	@command -v $(NODE) >/dev/null 2>&1 || { echo "wasm-test: $(NODE) not found; pass NODE="; exit 1; }
 	@for t in $(WASM_TESTS); do \
 		echo "--- $$t.wasm"; \
 		$(WASM_RUN) $(WASM_DIR)/$$t.wasm || exit 1; \
@@ -443,6 +520,12 @@ wasm-test: wasm
 	@echo "--- test_events.wasm"
 	$(WASM_RUN) $(WASM_DIR)/test_events.wasm $(WASM_DIR)/conf.sigmac \
 		$(ARCH_FIX)/arch.sigmac $(ARCH_FIX)/arch.corr.json
+	@echo "--- events corpus (events_golden.wasm vs golden.txt)"
+	$(WASM_RUN) $(WASM_DIR)/events_golden.wasm $(WASM_DIR)/corpus.sigmac $(EVC_ARGS) > $(WASM_DIR)/golden.txt
+	diff -u $(EVC)/golden.txt $(WASM_DIR)/golden.txt
+	@echo "--- JS loader (node --test, libsigma.wasm)"
+	LIBSIGMA_WASM=$(WASM_MODULE) CORPUS_SIGMAC=$(WASM_DIR)/corpus.sigmac \
+		$(NODE) --test $(SRCDIR)/js/libsigma-wasm.test.mjs
 	@echo "--- conformance (sigma_cli.wasm)"
 	@printf '$(CONF_EVENTS)' > $(WASM_DIR)/conf_ev.tsv
 	@out=$$($(WASM_RUN) $(WASM_DIR)/sigma_cli.wasm $(WASM_DIR)/conf.sigmac < $(WASM_DIR)/conf_ev.tsv); echo "$$out"; \
@@ -453,6 +536,37 @@ wasm-test: wasm
 		< $(ARCH_FIX)/arch.tsv > $(WASM_DIR)/arch-wasm.txt
 	diff -u $(ARCH_FIX)/arch.dump $(WASM_DIR)/arch-wasm.txt
 	@echo "wasm-test: wasm32 == NEON golden (matcher + corr), all engine tests passed"
+
+# UBSan in trap mode on wasm32: no runtime needed, a finding is a trap and a
+# non-zero exit. wasi-sdk has no ASan runtime; test-events-san runs ASan over
+# the same C natively. ubsan_canary must trap, or the flags are not in effect.
+WASM_SAN_FLAGS := -O1 -g -fsanitize=undefined -fsanitize-trap=undefined
+WASM_SAN_CC     = $(WASM_CC) $(WASM_CFLAGS) $(WASM_SAN_FLAGS) $(WASM_LDFLAGS)
+WASM_SAN_DIR   := $(WASM_DIR)/san
+
+wasm-san: wasm
+	@$(MAKE) --no-print-directory $(WASM_DIR)/corpus.sigmac
+	@test -x $(WASMTIME) || { echo "wasm-san: no wasmtime at $(WASMTIME); pass WASMTIME="; exit 1; }
+	@mkdir -p $(WASM_SAN_DIR)
+	@SIGMAC_SRC=$(SIGMAC_SRC) $(SIGMAC_PY) $(SRCDIR)/conformance_emit.py $(WASM_DIR)/conf.sigmac
+	$(WASM_SAN_CC) -o $(WASM_SAN_DIR)/ubsan_canary.wasm $(SRCDIR)/ubsan_canary.c
+	@if $(WASM_RUN) $(WASM_SAN_DIR)/ubsan_canary.wasm >/dev/null 2>&1; then \
+		echo "wasm-san: the canary did not trap; UBSan is not instrumenting"; exit 1; \
+	fi
+	$(WASM_SAN_CC) -D_WASI_EMULATED_PROCESS_CLOCKS -o $(WASM_SAN_DIR)/test_sigma_match.wasm \
+		$(SRCDIR)/test_sigma_match.c $(LIB_SRCS) $(WASM_LIBS) -lwasi-emulated-process-clocks
+	$(WASM_SAN_CC) -o $(WASM_SAN_DIR)/test_classify.wasm $(SRCDIR)/test_classify.c $(LIB_SRCS) $(WASM_LIBS)
+	$(WASM_SAN_CC) -o $(WASM_SAN_DIR)/test_events.wasm $(SRCDIR)/test_events.c $(SRCDIR)/sigma_events.c \
+		$(LIB_SRCS) $(WASM_LIBS)
+	$(WASM_SAN_CC) -o $(WASM_SAN_DIR)/events_golden.wasm $(SRCDIR)/events_golden.c $(SRCDIR)/sigma_events.c \
+		$(LIB_SRCS) $(WASM_LIBS)
+	$(WASM_RUN) $(WASM_SAN_DIR)/test_sigma_match.wasm
+	$(WASM_RUN) $(WASM_SAN_DIR)/test_classify.wasm
+	$(WASM_RUN) $(WASM_SAN_DIR)/test_events.wasm $(WASM_DIR)/conf.sigmac \
+		$(ARCH_FIX)/arch.sigmac $(ARCH_FIX)/arch.corr.json
+	$(WASM_RUN) $(WASM_SAN_DIR)/events_golden.wasm $(WASM_DIR)/corpus.sigmac $(EVC_ARGS) \
+		| diff -u $(EVC)/golden.txt -
+	@echo "wasm-san: UBSan (trap) clean on wasm32, canary trapped, transcript == golden.txt"
 
 install: all
 	install -d $(DESTDIR)$(PREFIX)/lib
