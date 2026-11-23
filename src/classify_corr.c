@@ -14,9 +14,9 @@
  *     when |distinct| satisfies the condition.
  *   - temporal: per-base-rid latest in-window ts; fire when ALL base rids are
  *     present (any order).
- *   - temporal_ordered: a running progress index + the anchor ts of step 0;
- *     reset when the anchor ages out; advance greedily through consecutive
- *     expected steps an event satisfies; fire (and reset progress) at the end.
+ *   - temporal_ordered: for each step k, the in-window run that completed
+ *     steps 0..k-1 with the latest anchor; a step-k hit advances that run, and
+ *     a step-0 hit starts a new one; fire (and clear every run) at the end.
  *   - re-fire suppression: stay "lit" for one full window after a fire.
  *
  * Copyright 2026 Advens.
@@ -215,10 +215,11 @@ struct group {
     double seen_ts[CORR_MAX_SEEN_RULES];
     uint32_t n_seen;
 
-    /* temporal_ordered. */
-    uint32_t ordered_progress;
-    double ordered_anchor_ts;
-    double ordered_last_ts; /* event time of the last advanced step (event-time mode) */
+    /* temporal_ordered: run[k] completed steps 0..k (n-1 entries, lazily
+     * allocated). anchor is the step-0 time, last the time of step k. */
+    struct ord_run {
+        double anchor, last;
+    }* ord;
 
     double last_update;
     double fired_until; /* re-fire suppression deadline */
@@ -457,6 +458,7 @@ static void group_free(group_t* g) {
     free(g->ev_ts);
     free(g->ev_val); /* NULL unless this was a value_sum/avg group */
     free(g->bbuckets); /* NULL unless this was a bucketed-beaconing group */
+    free(g->ord); /* NULL unless this was a temporal_ordered group */
     dset_free(&g->distinct);
     free(g);
 }
@@ -1324,57 +1326,62 @@ static int eval_temporal(const corr_rule_t* r,
     return 1;
 }
 
-/* temporal_ordered: greedy advance through consecutive expected steps that this
- * event satisfies; reset progress if the anchor aged out; fire + reset at end.
- * event_time: when set, `now` is the log's event time (not a monotonic
- * processing clock), so each advanced step's time must be non-decreasing - an
- * event processed later but timestamped earlier cannot fabricate an ordered
- * chain across concurrent sources. */
+/* temporal_ordered as a small NFA. A run that completed steps 0..k waits for
+ * step k+1; an event can advance a run and start another, so an early step-0
+ * hit no longer hides a later, complete sequence. Of the runs at one step only
+ * the latest anchor is kept: it stays in the window longest, and under arrival
+ * order every later step comes after it. Under event_time, a step must not
+ * predate the step before it, so a run with an older anchor but an earlier last
+ * step can be lost; the watermark path orders events before they get here.
+ * Steps are tried in order, so one event carrying several steps advances
+ * through all of them. Returns 1 on a complete sequence and clears every run. */
+#define ORD_EMPTY (-HUGE_VAL)
 static int eval_temporal_ordered(const corr_rule_t* r,
                                  group_t* g,
                                  const uint32_t* hit_rids,
                                  size_t n_hit,
                                  double now,
                                  double window_start,
-                                 int event_time) {
+                                 int event_time,
+                                 corr_stats_t* stats) {
     const uint32_t* order = (r->ordered_rule_ids && r->n_ordered_rule_ids) ? r->ordered_rule_ids : r->base_rule_ids;
     size_t n = (r->ordered_rule_ids && r->n_ordered_rule_ids) ? r->n_ordered_rule_ids : r->n_base_rule_ids;
     if (n == 0) return 0;
-    if (g->ordered_progress > 0 && g->ordered_anchor_ts < window_start) {
-        g->ordered_progress = 0;
-        g->ordered_anchor_ts = 0.0;
-        g->ordered_last_ts = 0.0;
+    if (n > 1 && g->ord == NULL) {
+        g->ord = malloc(sizeof(*g->ord) * (n - 1));
+        if (g->ord == NULL) {
+            if (stats) CS_INC(stats, oom_dropped);
+            return 0;
+        }
+        for (size_t k = 0; k + 1 < n; k++) g->ord[k].anchor = ORD_EMPTY;
     }
-    int advanced = 1;
-    while (advanced && g->ordered_progress < n) {
-        advanced = 0;
-        uint32_t expected = order[g->ordered_progress];
+    for (size_t k = 0; k + 1 < n; k++)
+        if (g->ord[k].anchor < window_start) g->ord[k].anchor = ORD_EMPTY;
+    for (size_t k = 0; k < n; k++) {
         int in_hit = 0;
         for (size_t i = 0; i < n_hit; i++)
-            if (hit_rids[i] == expected) {
+            if (hit_rids[i] == order[k]) {
                 in_hit = 1;
                 break;
             }
-        if (in_hit) {
-            if (g->ordered_progress == 0) {
-                g->ordered_anchor_ts = now;
-                g->ordered_last_ts = now;
-                g->ordered_progress++;
-                advanced = 1;
-            } else if (!event_time || now >= g->ordered_last_ts) {
-                g->ordered_last_ts = now;
-                g->ordered_progress++;
-                advanced = 1;
-            }
-            /* else (event_time && now < ordered_last_ts): this step's event time
-             * predates the previous step, so it is not a valid next step. */
+        if (!in_hit) continue;
+        double anchor;
+        if (k == 0) {
+            anchor = now;
+        } else {
+            const struct ord_run* prev = &g->ord[k - 1];
+            if (prev->anchor == ORD_EMPTY || (event_time && now < prev->last)) continue;
+            anchor = prev->anchor;
         }
-    }
-    if (g->ordered_progress >= n) {
-        g->ordered_progress = 0; /* ready to detect the next sequence */
-        g->ordered_anchor_ts = 0.0;
-        g->ordered_last_ts = 0.0;
-        return 1;
+        if (k + 1 == n) {
+            for (size_t m = 0; m + 1 < n; m++) g->ord[m].anchor = ORD_EMPTY;
+            return 1;
+        }
+        struct ord_run* cur = &g->ord[k];
+        if (cur->anchor == ORD_EMPTY || anchor > cur->anchor || (anchor == cur->anchor && now < cur->last)) {
+            cur->anchor = anchor;
+            cur->last = now;
+        }
     }
     return 0;
 }
@@ -1413,7 +1420,7 @@ static int eval_temporal_ordered_wm(const corr_rule_t* r,
     if (g->wm_max_ts > 0.0 && now + watermark_s < g->wm_max_ts) {
         /* this event is older than the slack behind the high water mark */
         if (stats) CS_INC(stats, watermark_late);
-        return eval_temporal_ordered(r, g, hit_rids, n_hit, now, window_start, 1);
+        return eval_temporal_ordered(r, g, hit_rids, n_hit, now, window_start, 1, stats);
     }
     for (size_t i = 0; i < n_hit; i++) wm_insert(g, now, hit_rids[i], stats);
     if (now > g->wm_max_ts) g->wm_max_ts = now;
@@ -1423,7 +1430,7 @@ static int eval_temporal_ordered_wm(const corr_rule_t* r,
     for (uint32_t i = 0; i < g->wm_n; i++) {
         if (g->wm[i].ts <= cutoff) {
             uint32_t one = g->wm[i].rid;
-            if (eval_temporal_ordered(r, g, &one, 1, g->wm[i].ts, window_start, 1)) fired = 1;
+            if (eval_temporal_ordered(r, g, &one, 1, g->wm[i].ts, window_start, 1, stats)) fired = 1;
         } else {
             g->wm[w++] = g->wm[i];
         }
@@ -1504,7 +1511,6 @@ int corr_on_event_apply(corr_engine_t* e,
      * a correlation may be hit by several rids, guard against double-eval). */
     /* Use a transient bitmap on the stack-free path: walk rid watches, and for
      * each candidate correlation evaluate once. We dedup with the state's
-     * `count`-independent visited marker reusing ordered_anchor_ts? No, use a
      * local visited array sized to n_states. */
     /* Small n_states in practice; allocate a visited byte array. */
     unsigned char* visited = calloc(e->n_states, 1);
@@ -1618,8 +1624,8 @@ int corr_on_event_apply(corr_engine_t* e,
                         fired_now = eval_temporal_ordered_wm(r, gs, hit_buf, n_hit, ts, window_start,
                                                              e->caps.watermark_s, &e->stats);
                     } else {
-                        fired_now =
-                            eval_temporal_ordered(r, gs, hit_buf, n_hit, ts, window_start, e->caps.event_time_ordering);
+                        fired_now = eval_temporal_ordered(r, gs, hit_buf, n_hit, ts, window_start,
+                                                          e->caps.event_time_ordering, &e->stats);
                     }
                     if (fired_now && r->n_cond > 0)
                         fired_now = corr_cond_eval(r->cond, r->n_cond, corr_seen_mask(r, gs));

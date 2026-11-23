@@ -10,6 +10,12 @@ is called out explicitly.
 
 ## [Unreleased]
 
+### Fixed
+
+- `temporal_ordered` kept one partial sequence per group and ignored a new
+  first step until the old one left the window, so an early first step hid
+  a later complete sequence. Each step now keeps its latest in-window run.
+
 ## [4.1.1] - 2026-11-16
 
 PATCH: a bounds fix. The C ABI, the SONAME (`libsigma.so.4`), the `.sigmac`

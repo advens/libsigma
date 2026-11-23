@@ -316,6 +316,46 @@ static void test_temporal_ordered(void) {
     corr_engine_free(e);
 }
 
+/* An early step-0 hit must not hide a later complete sequence. */
+static void test_temporal_ordered_rearm(void) {
+    const uint32_t a[] = {1}, b[] = {2}, c[] = {3};
+    corr_rule_t r = mk_temporal_ordered();
+    r.timespan_s = 60;
+
+    corr_engine_t* e = corr_engine_new(&r, 1, corr_caps_default());
+    feed(e, "203.0.113.9", NULL, a, 1, 1000.0, NULL);
+    feed(e, "203.0.113.9", NULL, a, 1, 1050.0, NULL);
+    CHECK(feed(e, "203.0.113.9", NULL, b, 1, 1070.0, NULL) == 1, "ordered rearm: A, A 50 s later, B 20 s after it");
+    CHECK(feed(e, "203.0.113.9", NULL, b, 1, 1080.0, NULL) == 0, "ordered rearm: a fire clears every run");
+    corr_engine_free(e);
+
+    e = corr_engine_new(&r, 1, corr_caps_default());
+    feed(e, "203.0.113.9", NULL, a, 1, 0.0, NULL);
+    CHECK(feed(e, "203.0.113.9", NULL, b, 1, 70.0, NULL) == 0, "ordered rearm: A and B a window apart");
+    corr_engine_free(e);
+
+    /* Three steps: the run anchored at the second A completes. */
+    static const uint32_t ABC[] = {1, 2, 3};
+    r.base_rule_ids = ABC;
+    r.n_base_rule_ids = 3;
+    r.ordered_rule_ids = ABC;
+    r.n_ordered_rule_ids = 3;
+    e = corr_engine_new(&r, 1, corr_caps_default());
+    feed(e, "203.0.113.9", NULL, a, 1, 0.0, NULL);
+    feed(e, "203.0.113.9", NULL, b, 1, 10.0, NULL);
+    feed(e, "203.0.113.9", NULL, a, 1, 50.0, NULL);
+    feed(e, "203.0.113.9", NULL, b, 1, 70.0, NULL);
+    CHECK(feed(e, "203.0.113.9", NULL, c, 1, 100.0, NULL) == 1, "ordered rearm: A B A B C, last A B C in window");
+    corr_engine_free(e);
+
+    e = corr_engine_new(&r, 1, corr_caps_default());
+    feed(e, "203.0.113.9", NULL, a, 1, 0.0, NULL);
+    feed(e, "203.0.113.9", NULL, c, 1, 10.0, NULL);
+    CHECK(feed(e, "203.0.113.9", NULL, b, 1, 20.0, NULL) == 0, "ordered rearm: A C B is not in order");
+    CHECK(feed(e, "203.0.113.9", NULL, c, 1, 30.0, NULL) == 1, "ordered rearm: then C completes A B C");
+    corr_engine_free(e);
+}
+
 /* event-time correlation clock (caps.event_time_ordering): temporal_ordered
  * requires each step's EVENT time to be non-decreasing, so a later-processed but
  * earlier-timestamped event cannot fabricate an ordered chain across concurrent
@@ -1193,6 +1233,7 @@ int main(void) {
     test_temporal();
     test_temporal_ordered();
     test_temporal_ordered_event_time();
+    test_temporal_ordered_rearm();
     test_window_expiry();
     test_refire_suppression();
     test_bounded_eviction();
