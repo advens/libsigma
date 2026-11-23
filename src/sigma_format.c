@@ -234,6 +234,8 @@ int sigma_db_load_buffer(uint8_t* buf, size_t len, sigma_db_t* out) {
      * This is what lets the matcher hand `strpool + off` directly to the
      * zero-copy C-string field lookup with NO bounce buffer / memcpy.  Reject
      * a non-terminated (corrupt/tampered) artifact. */
+    /* Field ids are uint16_t on disk and 0xFFFF is SIGMA_LITREF_ANY_FIELD. */
+    if (d.n_fields > SIGMA_LITREF_ANY_FIELD) return SIGMA_ERR_RANGE;
     for (uint32_t i = 0; i < d.n_fields; i++) {
         size_t end = (size_t)d.fields[i].off + d.fields[i].len;
         if (end + 1 > d.strpool_len) /* name + its terminator must fit */
@@ -243,7 +245,20 @@ int sigma_db_load_buffer(uint8_t* buf, size_t len, sigma_db_t* out) {
     }
     for (uint32_t i = 0; i < d.n_values; i++)
         if ((size_t)d.values[i].off + d.values[i].len > d.strpool_len) return SIGMA_ERR_RANGE;
+    /* The matcher reads prefix/8 bytes of the address (4 for v4, 16 for v6),
+     * plus one more when prefix%8 != 0. */
+    for (uint32_t i = 0; i < d.n_cidrs; i++) {
+        const sigma_cidr_t* c = &d.cidrs[i];
+        if (c->family == 4) {
+            if (c->prefix > 32) return SIGMA_ERR_RANGE;
+        } else if (c->family == 6) {
+            if (c->prefix > 128) return SIGMA_ERR_RANGE;
+        } else {
+            return SIGMA_ERR_RANGE;
+        }
+    }
     for (uint32_t i = 0; i < d.n_preds; i++) {
+        if (d.preds[i].op >= SIGMA_OP__MAX) return SIGMA_ERR_RANGE;
         if (d.preds[i].field_id >= d.n_fields) return SIGMA_ERR_RANGE;
         if (d.preds[i].flags & SIGMA_PF_FIELDREF) {
             /* |fieldref: value_id indexes the FIELDS table (the referenced field),
@@ -293,8 +308,8 @@ int sigma_db_load_buffer(uint8_t* buf, size_t len, sigma_db_t* out) {
     for (uint32_t i = 0; i < d.n_litndl; i++) {
         const sigma_str_t* n = &d.litndl[i];
         if ((size_t)n->off + n->len > d.strpool_len) return SIGMA_ERR_RANGE;
-        if (n->len == 0) /* an empty needle would match every line */
-            return SIGMA_ERR_RANGE;
+        /* The prefilter fingerprints the first two bytes of every needle. */
+        if (n->len < 2) return SIGMA_ERR_RANGE;
         if ((size_t)d.litpost[i].idx_start + d.litpost[i].idx_count > d.n_litpost_ref) return SIGMA_ERR_RANGE;
     }
     /* A posting names a rule, the field its literal must occur in, and which of
