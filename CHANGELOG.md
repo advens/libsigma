@@ -10,6 +10,20 @@ is called out explicitly.
 
 ## [Unreleased]
 
+### Added
+
+- `sigma_eval_re_unknown` returns how many `|re` evaluations on a scratch
+  ended on a PCRE2 limit.
+
+### Security
+
+- A `|re` that hit the PCRE2 match, depth, heap or JIT stack limit was
+  read as "no match", so padding a field hid a real match. Such a predicate
+  is now undecided, and a rule whose condition is undecided fires, on either
+  side of a NOT. A filter that matches still suppresses. An adversarial
+  non-match on a backtracking pattern now fires instead of staying silent.
+  The heap limit is now 16 MiB per match.
+
 ## [4.1.1] - 2026-11-16
 
 PATCH: a bounds fix. The C ABI, the SONAME (`libsigma.so.4`), the `.sigmac`
