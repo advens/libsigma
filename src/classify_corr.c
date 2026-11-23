@@ -252,7 +252,10 @@ typedef struct {
     uint32_t n_buckets;
     uint32_t count;
     group_t *lru_head, *lru_tail; /* head = LRU (least recently used) */
-    pthread_mutex_t lock; /* guards this correlation's group map (concurrent workers) */
+    pthread_mutex_t lock; /* guards this correlation's group map and scratch */
+    /* value_percentile / median only: sort copy of a group's ring. */
+    double* scratch;
+    uint32_t scratch_cap;
 } corr_state_t;
 
 /* Index entry: base rid -> list of correlation indices that watch it. */
@@ -280,10 +283,6 @@ struct corr_engine {
 
     /* Observable boundary counters (relaxed-atomic; see CS_INC). */
     corr_stats_t stats;
-
-    /* Scratch for value_percentile / median (qsort copy of the live ring). */
-    double* pct_scratch;
-    uint32_t pct_scratch_cap;
 };
 
 /* ---- small helpers ----------------------------------------------------- */
@@ -607,6 +606,9 @@ static void cstate_free(corr_state_t* st) {
         }
         free(st->buckets);
     }
+    free(st->scratch);
+    st->scratch = NULL;
+    st->scratch_cap = 0;
     st->buckets = NULL;
     st->n_buckets = st->count = 0;
     st->lru_head = st->lru_tail = NULL;
@@ -739,8 +741,13 @@ corr_engine_t* corr_engine_new(const corr_rule_t* rules, size_t n, corr_caps_t c
         st->count = 0;
         st->lru_head = st->lru_tail = NULL;
         st->buckets = calloc(st->n_buckets, sizeof(group_t*));
-        if (!st->buckets) {
+        if (st->buckets && (st->rule->type == CORR_VALUE_PERCENTILE || st->rule->type == CORR_VALUE_MEDIAN)) {
+            st->scratch_cap = caps.max_events_per_group;
+            st->scratch = malloc(sizeof(double) * st->scratch_cap);
+        }
+        if (!st->buckets || (st->scratch_cap && !st->scratch)) {
             /* roll back: free what we built */
+            free(st->buckets);
             for (size_t k = 0; k < admitted; k++) cstate_free(&e->states[k]);
             free(e->states);
             free(e);
@@ -767,27 +774,6 @@ corr_engine_t* corr_engine_new(const corr_rule_t* rules, size_t n, corr_caps_t c
 
     pthread_mutex_init(&e->sweep_lock, NULL);
     e->sweep_seen = 0;
-    e->pct_scratch_cap = caps.max_events_per_group;
-    e->pct_scratch = malloc(sizeof(double) * e->pct_scratch_cap);
-    if (!e->pct_scratch) {
-        for (size_t k = 0; k < admitted; k++) cstate_free(&e->states[k]);
-        free(e->states);
-        if (e->rid_buckets) {
-            for (uint32_t i = 0; i < e->n_rid_buckets; i++) {
-                rid_watch_t* w = e->rid_buckets[i];
-                while (w) {
-                    rid_watch_t* nx = w->next;
-                    free(w->corr_idx);
-                    free(w);
-                    w = nx;
-                }
-            }
-            free(e->rid_buckets);
-        }
-        pthread_mutex_destroy(&e->sweep_lock);
-        free(e);
-        return NULL;
-    }
     return e;
 }
 
@@ -808,7 +794,6 @@ void corr_engine_free(corr_engine_t* e) {
         free(e->rid_buckets);
     }
     pthread_mutex_destroy(&e->sweep_lock);
-    free(e->pct_scratch);
     free(e);
 }
 
@@ -1602,8 +1587,8 @@ int corr_on_event_apply(corr_engine_t* e,
                 case CORR_VALUE_PERCENTILE:
                 case CORR_VALUE_MEDIAN: {
                     const char* vv = field_fn ? field_fn(field_ctx, r->value_field) : NULL;
-                    fired_now = eval_value_percentile(r, gs, vv, ts, window_start, &e->stats, e->pct_scratch,
-                                                      e->pct_scratch_cap, &vagg);
+                    fired_now = eval_value_percentile(r, gs, vv, ts, window_start, &e->stats, st->scratch,
+                                                      st->scratch_cap, &vagg);
                     break;
                 }
                 case CORR_TEMPORAL:

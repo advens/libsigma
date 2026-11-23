@@ -10,6 +10,13 @@ is called out explicitly.
 
 ## [Unreleased]
 
+### Security
+
+- Percentile and median correlations shared one sort buffer across the
+  engine, while each correlation only holds its own lock. Two workers on two
+  such correlations wrote the same buffer and could fire on the other's
+  values. Each percentile or median correlation now owns its buffer.
+
 ## [4.1.1] - 2026-11-16
 
 PATCH: a bounds fix. The C ABI, the SONAME (`libsigma.so.4`), the `.sigmac`

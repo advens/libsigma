@@ -65,6 +65,8 @@ static const uint32_t B_EC[] = {1};
 static const uint32_t B_VC[] = {2};
 static const uint32_t B_TP[] = {3, 4};
 static const uint32_t B_VS[] = {5};
+static const uint32_t B_P95[] = {6};
+static const uint32_t B_MED[] = {7};
 
 static corr_rule_t RULES[] = {{.id = "ec",
                                .type = CORR_EVENT_COUNT,
@@ -118,6 +120,31 @@ static corr_rule_t RULES[] = {{.id = "ec",
                                .cond_count = 6,
                                .beacon_cv_permille = 200,
                                .timespan_s = 60,
+                               .level = "high"},
+                              /* Two sorting correlations under different locks:
+                               * each sorts its own scratch. */
+                              {.id = "p95",
+                               .type = CORR_VALUE_PERCENTILE,
+                               .base_rule_ids = B_P95,
+                               .n_base_rule_ids = 1,
+                               .group_by = GB_IP,
+                               .n_group_by = 1,
+                               .value_field = "destination.bytes",
+                               .value_percentile = 95,
+                               .cond_op = CORR_OP_GT,
+                               .cond_count = 1000,
+                               .timespan_s = 60,
+                               .level = "high"},
+                              {.id = "med",
+                               .type = CORR_VALUE_MEDIAN,
+                               .base_rule_ids = B_MED,
+                               .n_base_rule_ids = 1,
+                               .group_by = GB_HOST,
+                               .n_group_by = 1,
+                               .value_field = "destination.bytes",
+                               .cond_op = CORR_OP_GT,
+                               .cond_count = 1000,
+                               .timespan_s = 60,
                                .level = "high"}};
 
 static corr_engine_t* g_eng;
@@ -149,7 +176,7 @@ static void* worker(void* arg) {
 
         uint32_t rids[2];
         int nr = 0;
-        switch (r % 5) {
+        switch (r % 7) {
             case 0:
                 rids[nr++] = 1;
                 break; /* event_count base */
@@ -162,6 +189,12 @@ static void* worker(void* arg) {
             case 3:
                 rids[nr++] = 5;
                 break; /* value_sum base */
+            case 4:
+                rids[nr++] = 6;
+                break; /* percentile base */
+            case 5:
+                rids[nr++] = 7;
+                break; /* median base */
             default:
                 rids[nr++] = 3;
                 rids[nr++] = 4;
@@ -213,9 +246,10 @@ int main(void) {
     size_t groups = corr_engine_total_groups(g_eng);
 
     int ok = 1;
-    if (corr_engine_rule_count(g_eng) != 5) ok = 0; /* ec + vc + tp + vs + bc */
+    const size_t n_rules = sizeof(RULES) / sizeof(RULES[0]);
+    if (corr_engine_rule_count(g_eng) != n_rules) ok = 0;
     /* Every correlation's live group count is capped at max_groups. */
-    if (groups > (size_t)caps.max_groups * 5) ok = 0;
+    if (groups > (size_t)caps.max_groups * n_rules) ok = 0;
 
     printf(
         "concurrency: %d threads x %d iters, fires=%ld, live_groups=%zu, "
