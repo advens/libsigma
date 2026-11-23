@@ -39,6 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <assert.h>
 #include <stdbool.h>
 
@@ -1179,6 +1180,73 @@ static void test_group_by_aliases(void) {
     corr_engine_free(e);
 }
 
+
+/* Receive clock: event time from the sender cannot wipe or mute state. */
+static double g_clock;
+static double test_now(void* ctx) {
+    (void)ctx;
+    return g_clock;
+}
+
+static void test_receive_clock(void) {
+    corr_rule_t r = mk_event_count();
+    r.cond_count = 5;
+    r.timespan_s = 60;
+    uint64_t nf = 0, ahead = 0, behind = 0;
+
+    /* No clock: a non-finite event time is refused and state is kept. */
+    {
+        corr_engine_t* e = corr_engine_new(&r, 1, corr_caps_default());
+        for (int i = 0; i < 4; i++) feed(e, "203.0.113.9", "root", BASE_1, 1, 1000.0 + i, NULL);
+        CHECK(feed(e, "203.0.113.9", "root", BASE_1, 1, NAN, NULL) == 0, "clock: no clock, NaN ts refused");
+        CHECK(feed(e, "203.0.113.9", "root", BASE_1, 1, INFINITY, NULL) == 0, "clock: no clock, inf ts refused");
+        corr_engine_clock_stats(e, &nf, &ahead, &behind);
+        CHECK(nf == 2 && ahead == 0 && behind == 0, "clock: no clock, two non-finite counted");
+        CHECK(feed(e, "203.0.113.9", "root", BASE_1, 1, 1004.0, NULL) == 1, "clock: no clock, 5th event still fires");
+        corr_engine_free(e);
+    }
+
+    corr_engine_t* e = corr_engine_new(&r, 1, corr_caps_default());
+    CHECK(corr_engine_set_clock(NULL, test_now, NULL, 300, 10) == -1, "clock: NULL engine refused");
+    CHECK(corr_engine_set_clock(e, test_now, NULL, -1, 10) == -1, "clock: negative bound refused");
+    CHECK(corr_engine_set_clock(e, test_now, NULL, NAN, 10) == -1, "clock: NaN bound refused");
+    CHECK(corr_engine_set_clock(e, test_now, NULL, 300, 60) == 0, "clock: set");
+    g_clock = 1000.0;
+    for (int i = 0; i < 4; i++) feed(e, "203.0.113.9", "root", BASE_1, 1, 1000.0 + i, NULL);
+    /* An event dated 2100 on another group, then a contribution at 1e18. */
+    feed(e, "198.51.100.1", "x", BASE_1, 1, 4102444800.0, NULL);
+    {
+        const char* gvals[] = {"198.51.100.2", "y"};
+        corr_contrib_t c;
+        memset(&c, 0, sizeof(c));
+        c.kind = CORR_CONTRIB_COUNT;
+        c.corr_id = "brute";
+        c.group_vals = gvals;
+        c.n_group = 2;
+        c.ts = 1e18;
+        c.count = 1;
+        corr_fire_t fires[4];
+        static const char* scratch[8 * CORR_MAX_GROUP_FIELDS];
+        corr_on_contribution(e, &c, NULL, NULL, fires, 4, scratch, 32);
+    }
+    g_clock = 1040.0; /* past the sweep interval */
+    CHECK(corr_engine_groups_for(e, "brute") == 3, "clock: future-dated input kept the other groups");
+    CHECK(feed(e, "203.0.113.9", "root", BASE_1, 1, 1004.0, NULL) == 1, "clock: 5th event fires after a 2100 event");
+    CHECK(feed(e, "203.0.113.10", "root", BASE_1, 1, NAN, NULL) == 0, "clock: NaN ts replaced by the clock");
+    CHECK(feed(e, "203.0.113.11", "root", BASE_1, 1, 0.0, NULL) == 0, "clock: ts 0 accepted, clamped");
+    corr_engine_clock_stats(e, &nf, &ahead, &behind);
+    CHECK(ahead == 2, "clock: two event times clamped ahead");
+    CHECK(nf == 1, "clock: one non-finite replaced");
+    CHECK(behind == 1, "clock: one event time clamped behind");
+
+    /* The sweep runs on the clock: past ahead + behind + timespan, every group
+     * expires. */
+    g_clock = 1500.0;
+    feed(e, "192.0.2.77", "z", BASE_1, 1, g_clock, NULL);
+    CHECK(corr_engine_groups_for(e, "brute") == 1, "clock: sweep on the clock dropped expired groups");
+    corr_engine_free(e);
+}
+
 int main(void) {
     test_event_count();
     test_value_count();
@@ -1203,6 +1271,7 @@ int main(void) {
     test_beaconing();
     test_beaconing_bucketed();
     test_group_by_aliases();
+    test_receive_clock();
 
     printf("\nlibsigma correlation engine: %d passed, %d failed\n", g_pass, g_fail);
     if (g_fail == 0) printf("PASSED %d/%d\n", g_pass, g_pass);

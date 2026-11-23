@@ -281,6 +281,12 @@ struct corr_engine {
     /* Observable boundary counters (relaxed-atomic; see CS_INC). */
     corr_stats_t stats;
 
+    /* Receive clock (corr_engine_set_clock), set before the engine is shared. */
+    corr_clock_fn clock_fn;
+    void* clock_ctx;
+    double max_ahead_s, max_behind_s;
+    uint64_t ts_nonfinite, ts_ahead, ts_behind; /* relaxed-atomic */
+
     /* Scratch for value_percentile / median (qsort copy of the live ring). */
     double* pct_scratch;
     uint32_t pct_scratch_cap;
@@ -1435,6 +1441,51 @@ static int eval_temporal_ordered_wm(const corr_rule_t* r,
 /* ============================================================================
  * the hot evaluation.
  * ========================================================================== */
+int corr_engine_set_clock(corr_engine_t* e, corr_clock_fn now_fn, void* ctx, double max_ahead_s, double max_behind_s) {
+    if (!e || !isfinite(max_ahead_s) || !isfinite(max_behind_s) || max_ahead_s < 0.0 || max_behind_s < 0.0) return -1;
+    e->clock_fn = now_fn;
+    e->clock_ctx = ctx;
+    e->max_ahead_s = max_ahead_s;
+    e->max_behind_s = max_behind_s;
+    return 0;
+}
+
+void corr_engine_clock_stats(const corr_engine_t* e, uint64_t* nonfinite, uint64_t* ahead, uint64_t* behind) {
+    if (nonfinite) *nonfinite = e ? __atomic_load_n(&e->ts_nonfinite, __ATOMIC_RELAXED) : 0;
+    if (ahead) *ahead = e ? __atomic_load_n(&e->ts_ahead, __ATOMIC_RELAXED) : 0;
+    if (behind) *behind = e ? __atomic_load_n(&e->ts_behind, __ATOMIC_RELAXED) : 0;
+}
+
+/* Bound *ts by the receive clock and set *sweep_now to the time the sweep runs
+ * on. Without a clock, event time is trusted and only a non-finite one is
+ * refused. With one, the sweep horizon is the clock minus max_behind_s, the
+ * oldest event time the engine still accepts. Returns 0 to refuse the event. */
+static int bound_event_time(corr_engine_t* e, double* ts, double* sweep_now) {
+    if (e->clock_fn) {
+        const double now = e->clock_fn(e->clock_ctx);
+        if (isfinite(now)) {
+            if (!isfinite(*ts)) {
+                CS_INC(e, ts_nonfinite);
+                *ts = now;
+            } else if (*ts > now + e->max_ahead_s) {
+                CS_INC(e, ts_ahead);
+                *ts = now + e->max_ahead_s;
+            } else if (*ts < now - e->max_behind_s) {
+                CS_INC(e, ts_behind);
+                *ts = now - e->max_behind_s;
+            }
+            *sweep_now = now - e->max_behind_s;
+            return 1;
+        }
+    }
+    if (!isfinite(*ts)) {
+        CS_INC(e, ts_nonfinite);
+        return 0;
+    }
+    *sweep_now = *ts;
+    return 1;
+}
+
 static void sweep_if_due(corr_engine_t* e, double now) {
     /* Single-flight: only one worker sweeps at a time; the rest skip via trylock
      * (they called with no state lock held, so no deadlock).  last_sweep and
@@ -1492,7 +1543,9 @@ int corr_on_event_apply(corr_engine_t* e,
                         void* apply_ctx) {
     if (!e || e->n_states == 0 || n_rids == 0) return 0;
 
-    sweep_if_due(e, ts);
+    double sweep_now;
+    if (!bound_event_time(e, &ts, &sweep_now)) return 0;
+    sweep_if_due(e, sweep_now);
 
     /* Which correlations care about any rid on this event? Mark them via a
      * per-call interested flag stored on the state (cleared after use). We use
@@ -1732,7 +1785,9 @@ int corr_on_contribution(corr_engine_t* e,
                              grp_scratch_cap);
     if (c->corr_id == NULL || c->corr_id[0] == '\0') return 0;
 
-    sweep_if_due(e, c->ts);
+    double ts = c->ts, sweep_now;
+    if (!bound_event_time(e, &ts, &sweep_now)) return 0;
+    sweep_if_due(e, sweep_now);
     corr_state_t* st = corr_state_by_id(e, c->corr_id);
     if (!st) return 0;
     const corr_rule_t* r = st->rule;
@@ -1750,7 +1805,7 @@ int corr_on_contribution(corr_engine_t* e,
     }
 
     double timespan = (double)r->timespan_s;
-    double window_start = c->ts - timespan;
+    double window_start = ts - timespan;
     pthread_mutex_lock(&st->lock);
     group_t* gs = cstate_get_or_create(st, &e->caps, (const char* const*)gvals, r->n_group_by, &e->stats);
     if (!gs) {
@@ -1758,7 +1813,7 @@ int corr_on_contribution(corr_engine_t* e,
         CS_INC(&e->stats, oom_dropped);
         return 0;
     }
-    gs->last_update = c->ts;
+    gs->last_update = ts;
     gs->merge_remote = 1;
 
     int fired_now = 0;
@@ -1794,11 +1849,11 @@ int corr_on_contribution(corr_engine_t* e,
         }
         case CORR_CONTRIB_DISTINCT:
             if (r->type == CORR_VALUE_COUNT && c->value != NULL)
-                fired_now = eval_value_count(r, gs, c->value, e->caps.max_distinct, c->ts, window_start, &e->stats);
+                fired_now = eval_value_count(r, gs, c->value, e->caps.max_distinct, ts, window_start, &e->stats);
             break;
         case CORR_CONTRIB_SEEN:
             gs->merge_seen |= c->seen_mask;
-            if (r->type == CORR_TEMPORAL) fired_now = eval_temporal(r, gs, NULL, 0, c->ts, window_start, &e->stats);
+            if (r->type == CORR_TEMPORAL) fired_now = eval_temporal(r, gs, NULL, 0, ts, window_start, &e->stats);
             break;
         case CORR_CONTRIB_EVENT:
         default:
@@ -1809,12 +1864,12 @@ int corr_on_contribution(corr_engine_t* e,
         pthread_mutex_unlock(&st->lock);
         return 0;
     }
-    if (c->ts < gs->fired_until) {
+    if (ts < gs->fired_until) {
         pthread_mutex_unlock(&st->lock);
         CS_INC(&e->stats, fires_suppressed);
         return 0;
     }
-    gs->fired_until = c->ts + timespan * CORR_REFIRE_FRACTION;
+    gs->fired_until = ts + timespan * CORR_REFIRE_FRACTION;
     int64_t observed_val;
     const char* observed_vfield = NULL;
     if (r->type == CORR_VALUE_COUNT) {
