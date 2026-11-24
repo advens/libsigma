@@ -1200,6 +1200,18 @@ static void test_route_parser_stamp(void) {
         CHECK(!fires(ev, &e, 10, NULL), "stamp: category=web without product=nginx skips nginx rule");
         CHECK(!fires(ev, &e, 20, NULL), "stamp: category=web does not hit auth");
     }
+    {
+        /* A parser that stamps another case must not prune the rule. */
+        kv_t kv[] = {{"techno", "Web"}, {"product", "NGINX"}, {"url.path", "/admin/x"}, {"user.name", "root"}};
+        event_t e = {kv, 4};
+        CHECK(fires(ev, &e, 10, NULL), "stamp: product=NGINX routes to the nginx bucket");
+        CHECK(!fires(ev, &e, 20, NULL), "stamp: product=NGINX does not hit auth");
+    }
+    {
+        kv_t kv[] = {{"product", "Auth"}, {"user.name", "root"}};
+        event_t e = {kv, 2};
+        CHECK(fires(ev, &e, 20, NULL), "stamp: product=Auth routes to the auth bucket");
+    }
     sigma_eval_free(ev);
     sigma_db_free(&d);
     free(buf);
