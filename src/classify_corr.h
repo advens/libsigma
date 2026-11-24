@@ -48,7 +48,8 @@
  * may still be inside it.
  *
  * BOUNDED EVICTION (anti-exhaustion):
- *   1. per-correlation LRU group cap (max_groups, default 50000)
+ *   1. per-correlation group cap (max_groups, default 50000): a new group
+ *      evicts the least recently used group of the lowest progress tier
  *   2. lazy time eviction: every event prunes in-group timestamps older than
  *      the window and drops empty groups
  *   3. periodic global sweep (sweep_interval_s) drops fully-expired groups
@@ -209,7 +210,7 @@ typedef struct {
 
 /* Operator-tunable bounds.  Pass {0,0,0,0} to corr_caps_default() for defaults. */
 typedef struct {
-    uint32_t max_groups; /* per-correlation LRU group cap (50000) */
+    uint32_t max_groups; /* per-correlation group cap (50000) */
     uint32_t max_distinct; /* value_count distinct-set cap (10000) */
     uint32_t max_events_per_group; /* event ring cap (4096) */
     double sweep_interval_s; /* global expired-group sweep cadence (30.0) */
@@ -258,7 +259,7 @@ size_t corr_engine_groups_for(const corr_engine_t* e, const char* id);
  * intended windowing) are NOT counted, only cap-driven eviction/overwrite/drop.
  * -------------------------------------------------------------------------- */
 typedef struct {
-    uint64_t groups_evicted; /* LRU group eviction (max_groups) */
+    uint64_t groups_evicted; /* group eviction (max_groups) */
     uint64_t distinct_evicted; /* value_count distinct eviction (max_distinct) */
     uint64_t events_overwritten; /* event-ring overwrite (max_events_per_group) */
     uint64_t fires_suppressed; /* re-fire suppression within a lit window */
@@ -293,6 +294,11 @@ typedef double (*corr_clock_fn)(void* ctx);
  * call from every worker. Returns 0, or -1 on a NULL engine or a negative or
  * non-finite bound. */
 int corr_engine_set_clock(corr_engine_t* e, corr_clock_fn now_fn, void* ctx, double max_ahead_s, double max_behind_s);
+
+/* Groups evicted at max_groups while holding two or more recent hits. A full
+ * map evicts groups with one recent hit first, so a non-zero rate means the
+ * map is too small for the traffic or someone is pushing real groups out. */
+uint64_t corr_engine_groups_evicted_progress(const corr_engine_t* e);
 
 /* Event times refused or replaced for being non-finite, and clamped for being
  * ahead of or behind the clock. Any pointer may be NULL. */

@@ -73,6 +73,7 @@
 #define CORR_BEACON_MAX_BUCKETS 1024
 #define CORR_WM_CAP 32 /* temporal_ordered pending events under watermark slack */
 #define CORR_RING_MIN 8u /* first ring allocation; doubles up to max_events_per_group */
+#define CORR_TIERS 8u /* eviction tiers: floor(log2(recent hits)), the last one open */
 
 /* ============================================================================
  * tier_for_correlation + tier helpers
@@ -346,9 +347,15 @@ struct group {
     uint32_t wm_n;
     double wm_max_ts;
 
+    /* Progress for eviction: hits credited since hits_since, halved for each
+     * whole window that passes, and the tier they give (see group_credit). */
+    uint32_t hits;
+    uint8_t tier;
+    double hits_since;
+
     uint64_t h;
     group_t* hnext; /* hash chain */
-    group_t *lru_prev, *lru_next; /* LRU list (head = LRU oldest) */
+    group_t *lru_prev, *lru_next; /* LRU list of its tier (head = LRU oldest) */
 };
 
 /* ============================================================================
@@ -359,7 +366,11 @@ typedef struct {
     group_t** buckets;
     uint32_t n_buckets;
     uint32_t count;
-    group_t *lru_head, *lru_tail; /* head = LRU (least recently used) */
+    /* One LRU list per progress tier (head = least recently used). A full map
+     * evicts from the lowest non-empty tier. */
+    group_t* lru_head[CORR_TIERS];
+    group_t* lru_tail[CORR_TIERS];
+    uint32_t tier_mask; /* bit t set while tier t is non-empty */
     pthread_mutex_t lock; /* guards this correlation's group map and scratch */
     /* value_percentile / median only: sort copy of a group's ring. */
     double* scratch;
@@ -397,6 +408,7 @@ struct corr_engine {
     void* clock_ctx;
     double max_ahead_s, max_behind_s;
     uint64_t ts_nonfinite, ts_ahead, ts_behind; /* relaxed-atomic */
+    uint64_t groups_evicted_progress; /* relaxed-atomic */
 };
 
 /* ---- small helpers ----------------------------------------------------- */
@@ -612,25 +624,50 @@ static group_t* group_new(const char* const* vals, size_t n, uint64_t h, uint32_
  * corr_state (per-correlation bounded LRU group map).
  * ========================================================================== */
 static void cstate_unlink_lru(corr_state_t* st, group_t* g) {
+    const unsigned t = g->tier;
     if (g->lru_prev)
         g->lru_prev->lru_next = g->lru_next;
     else
-        st->lru_head = g->lru_next;
+        st->lru_head[t] = g->lru_next;
     if (g->lru_next)
         g->lru_next->lru_prev = g->lru_prev;
     else
-        st->lru_tail = g->lru_prev;
+        st->lru_tail[t] = g->lru_prev;
+    if (!st->lru_head[t]) st->tier_mask &= ~(1u << t);
     g->lru_prev = g->lru_next = NULL;
 }
 
 static void cstate_push_mru(corr_state_t* st, group_t* g) {
-    g->lru_prev = st->lru_tail;
+    const unsigned t = g->tier;
+    g->lru_prev = st->lru_tail[t];
     g->lru_next = NULL;
-    if (st->lru_tail)
-        st->lru_tail->lru_next = g;
+    if (st->lru_tail[t])
+        st->lru_tail[t]->lru_next = g;
     else
-        st->lru_head = g;
-    st->lru_tail = g;
+        st->lru_head[t] = g;
+    st->lru_tail[t] = g;
+    st->tier_mask |= 1u << t;
+}
+
+static void cstate_reset_lru(corr_state_t* st) {
+    for (unsigned t = 0; t < CORR_TIERS; t++) st->lru_head[t] = st->lru_tail[t] = NULL;
+    st->tier_mask = 0;
+}
+
+/* Credit n hits at ts and set the group's tier to floor(log2(hits)), capped.
+ * Hits halve for each whole window since hits_since, so the tier follows the
+ * recent rate and not the lifetime total. The group must be unlinked. */
+static void group_credit(group_t* g, uint32_t n, double ts, double window) {
+    if (g->hits == 0) {
+        g->hits_since = ts;
+    } else if (ts - g->hits_since >= window) {
+        const double k = floor((ts - g->hits_since) / window);
+        g->hits = k >= 32.0 ? 0u : g->hits >> (unsigned)k;
+        g->hits_since = ts;
+    }
+    g->hits = g->hits > UINT32_MAX - n ? UINT32_MAX : g->hits + n;
+    const unsigned t = 31u - (unsigned)__builtin_clz(g->hits | 1u);
+    g->tier = (uint8_t)(t < CORR_TIERS ? t : CORR_TIERS - 1u);
 }
 
 static void cstate_remove(corr_state_t* st, group_t* g) {
@@ -663,31 +700,37 @@ static int cstate_grow(corr_state_t* st) {
     return 0;
 }
 
-/* Get-or-create the group for `vals`, evicting the LRU one at capacity.  Marks
- * the returned group most-recently-used (mirrors OrderedDict.move_to_end). */
+/* Get-or-create the group for `vals`, credit it `hits` at ts and mark it most
+ * recently used in its tier. At capacity a new group evicts the least recently
+ * used group of the lowest tier, so creating groups pushes out other groups
+ * with as little progress, never one closer to firing while those remain. */
 static group_t* cstate_get_or_create(
-    corr_state_t* st, const corr_caps_t* caps, const char* const* vals, size_t n, corr_stats_t* stats) {
+    corr_engine_t* e, corr_state_t* st, const char* const* vals, size_t n, uint32_t hits, double ts) {
+    const double window = (double)st->rule->timespan_s;
     uint64_t h = hash_group_key(vals, n);
     uint32_t b = (uint32_t)(h & (st->n_buckets - 1));
     for (group_t* g = st->buckets[b]; g; g = g->hnext) {
         if (g->h == h && g->n_key == n && group_key_eq((const char* const*)g->key, vals, n)) {
             cstate_unlink_lru(st, g);
+            group_credit(g, hits, ts, window);
             cstate_push_mru(st, g);
             return g;
         }
     }
-    /* Admit a new group, evicting the LRU one at capacity (anti-exhaustion). */
-    if (st->count >= caps->max_groups && st->lru_head) {
-        cstate_remove(st, st->lru_head);
-        if (stats) CS_INC(stats, groups_evicted);
+    if (st->count >= e->caps.max_groups && st->tier_mask) {
+        const unsigned t = (unsigned)__builtin_ctz(st->tier_mask);
+        cstate_remove(st, st->lru_head[t]);
+        CS_INC(&e->stats, groups_evicted);
+        if (t > 0) CS_INC(e, groups_evicted_progress);
     }
 
     if (st->count + 1 > (st->n_buckets * 3) / 4) {
         (void)cstate_grow(st);
         b = (uint32_t)(h & (st->n_buckets - 1));
     }
-    group_t* g = group_new(vals, n, h, caps->max_events_per_group);
+    group_t* g = group_new(vals, n, h, e->caps.max_events_per_group);
     if (!g) return NULL;
+    group_credit(g, hits, ts, window);
     g->hnext = st->buckets[b];
     st->buckets[b] = g;
     cstate_push_mru(st, g);
@@ -697,14 +740,16 @@ static group_t* cstate_get_or_create(
 
 /* Drop groups whose last_update < horizon (the periodic sweep). */
 static void cstate_drop_expired(corr_state_t* st, double horizon) {
-    /* Walk the LRU list; a group's last_update is event time, not recency, so
+    /* Walk every tier; a group's last_update is event time, not recency, so
      * scan all (bounded by max_groups). Snapshot-free deletion is safe because
-     * cstate_remove only touches the node + its neighbours. */
-    group_t* g = st->lru_head;
-    while (g) {
-        group_t* nx = g->lru_next;
-        if (g->last_update < horizon) cstate_remove(st, g);
-        g = nx;
+     * cstate_remove only touches the node + its neighbours in its own tier. */
+    for (unsigned t = 0; t < CORR_TIERS; t++) {
+        group_t* g = st->lru_head[t];
+        while (g) {
+            group_t* nx = g->lru_next;
+            if (g->last_update < horizon) cstate_remove(st, g);
+            g = nx;
+        }
     }
 }
 
@@ -725,7 +770,7 @@ static void cstate_free(corr_state_t* st) {
     st->scratch_cap = 0;
     st->buckets = NULL;
     st->n_buckets = st->count = 0;
-    st->lru_head = st->lru_tail = NULL;
+    cstate_reset_lru(st);
     pthread_mutex_destroy(&st->lock);
 }
 
@@ -853,7 +898,7 @@ corr_engine_t* corr_engine_new(const corr_rule_t* rules, size_t n, corr_caps_t c
         st->rule = &rules[i];
         st->n_buckets = 16;
         st->count = 0;
-        st->lru_head = st->lru_tail = NULL;
+        cstate_reset_lru(st);
         st->buckets = calloc(st->n_buckets, sizeof(group_t*));
         if (st->buckets && (st->rule->type == CORR_VALUE_PERCENTILE || st->rule->type == CORR_VALUE_MEDIAN)) {
             st->scratch_cap = caps.max_events_per_group;
@@ -1604,6 +1649,10 @@ int corr_engine_set_clock(corr_engine_t* e, corr_clock_fn now_fn, void* ctx, dou
     return 0;
 }
 
+uint64_t corr_engine_groups_evicted_progress(const corr_engine_t* e) {
+    return e ? __atomic_load_n(&e->groups_evicted_progress, __ATOMIC_RELAXED) : 0;
+}
+
 void corr_engine_clock_stats(const corr_engine_t* e, uint64_t* nonfinite, uint64_t* ahead, uint64_t* behind) {
     if (nonfinite) *nonfinite = e ? __atomic_load_n(&e->ts_nonfinite, __ATOMIC_RELAXED) : 0;
     if (ahead) *ahead = e ? __atomic_load_n(&e->ts_ahead, __ATOMIC_RELAXED) : 0;
@@ -1760,7 +1809,7 @@ int corr_on_event_apply(corr_engine_t* e,
              * and runs in parallel; two workers on the same correlation serialise
              * here (correctly) but never on the line-rate match path. */
             pthread_mutex_lock(&st->lock);
-            group_t* gs = cstate_get_or_create(st, &e->caps, (const char* const*)gvals, r->n_group_by, &e->stats);
+            group_t* gs = cstate_get_or_create(e, st, (const char* const*)gvals, r->n_group_by, 1u, ts);
             if (!gs) {
                 pthread_mutex_unlock(&st->lock);
                 CS_INC(&e->stats, oom_dropped);
@@ -1963,7 +2012,7 @@ int corr_on_contribution(corr_engine_t* e,
     double timespan = (double)r->timespan_s;
     double window_start = ts - timespan;
     pthread_mutex_lock(&st->lock);
-    group_t* gs = cstate_get_or_create(st, &e->caps, (const char* const*)gvals, r->n_group_by, &e->stats);
+    group_t* gs = cstate_get_or_create(e, st, (const char* const*)gvals, r->n_group_by, c->count ? c->count : 1u, ts);
     if (!gs) {
         pthread_mutex_unlock(&st->lock);
         CS_INC(&e->stats, oom_dropped);

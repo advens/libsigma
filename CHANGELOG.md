@@ -20,6 +20,8 @@ are unchanged.
   times were non-finite, ahead, or behind.
 - `sigma_eval_re_unknown` returns how many `|re` evaluations on a scratch
   ended on a PCRE2 limit.
+- `corr_engine_groups_evicted_progress` returns how many groups were evicted
+  at `max_groups` while holding two or more recent hits.
 
 ### Fixed
 
@@ -74,6 +76,11 @@ are unchanged.
   held. The ring now starts at 8 entries and doubles up to the cap, and the
   ring, the distinct set, the seen tables and the watermark buffer are
   allocated by the types that use them: the same 50000 groups take 17 MiB.
+- A full group map evicted its least recently used group, so a sender who
+  knew a correlation's group-by could push a group close to its threshold
+  out by creating new groups. Groups now sit in tiers by recent hits
+  (halved each window), and a new group evicts the least recently used
+  group of the lowest tier: a flood of one-event groups evicts its own.
 
 ## [4.1.1] - 2026-11-16
 
