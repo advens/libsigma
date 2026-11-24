@@ -10,6 +10,15 @@ is called out explicitly.
 
 ## [Unreleased]
 
+### Security
+
+- Correlation group keys and distinct values were hashed with unkeyed
+  FNV-1a, and both tables bucket on the low bits, so a sender could build
+  keys offline that land in one chain and make every event walk it under the
+  correlation lock. They now use SipHash-1-3 under a random per-process key.
+  The owner hash (`corr_owner_index`) is unchanged: peers must agree on it.
+  The wasm module keys from the clock and takes no new import.
+
 ## [4.1.1] - 2026-11-16
 
 PATCH: a bounds fix. The C ABI, the SONAME (`libsigma.so.4`), the `.sigmac`

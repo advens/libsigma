@@ -44,7 +44,11 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <math.h> /* isfinite for value_sum/avg numeric parse */
+#if defined(__linux__)
+    #include <sys/random.h>
+#endif
 
 /* Concurrency: the engine is safe for concurrent corr_on_event from
  * multiple caller threads.  Each correlation's group map is guarded by its own
@@ -115,34 +119,133 @@ corr_caps_t corr_caps_default(void) {
 }
 
 /* ============================================================================
- * FNV-1a hash over a length-tagged byte run (group keys, distinct values).
+ * Keyed hash for group keys and distinct values: SipHash-1-3 under a random
+ * per-process key. Both tables bucket on the low bits of the hash; with an
+ * unkeyed hash a sender can build keys offline that share those bits and turn
+ * every lookup into a chain walk under the correlation lock. The owner hash
+ * (corr_owner_index) is a different use and stays unkeyed: peers must agree.
  * ========================================================================== */
-static uint64_t fnv1a(const void* data, size_t len) {
-    const unsigned char* p = (const unsigned char*)data;
-    uint64_t h = 1469598103934665603ULL;
-    for (size_t i = 0; i < len; i++) {
-        h ^= p[i];
-        h *= 1099511628211ULL;
-    }
-    return h;
+#ifndef CORR_SIP_C_ROUNDS
+    #define CORR_SIP_C_ROUNDS 1
+#endif
+#ifndef CORR_SIP_D_ROUNDS
+    #define CORR_SIP_D_ROUNDS 3
+#endif
+
+static uint64_t g_hkey[2];
+static pthread_once_t g_hkey_once = PTHREAD_ONCE_INIT;
+
+static void hkey_init(void) {
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    arc4random_buf(g_hkey, sizeof(g_hkey));
+    return;
+#else
+    #if defined(__linux__)
+    if (getrandom(g_hkey, sizeof(g_hkey), 0) == (ssize_t)sizeof(g_hkey)) return;
+    #endif
+    /* No entropy source, or WASI, where the module takes no random_get import
+     * so its host interface stays the same: the clock still varies the key
+     * across hosts and restarts. */
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    g_hkey[0] = (uint64_t)ts.tv_nsec * 0x9E3779B97F4A7C15ull ^ (uint64_t)(uintptr_t)&g_hkey;
+    g_hkey[1] = (uint64_t)ts.tv_sec * 0xC2B2AE3D27D4EB4Full ^ (uint64_t)(uintptr_t)&ts;
+#endif
 }
 
-/* Hash a group-key tuple: each value's bytes + a separator (NUL byte) so that
+typedef struct {
+    uint64_t v0, v1, v2, v3;
+    uint64_t tail; /* pending bytes, little-endian */
+    uint64_t len; /* bytes absorbed */
+} sip_t;
+
+#define SIP_ROTL(x, b) (uint64_t)(((x) << (b)) | ((x) >> (64 - (b))))
+#define SIP_ROUND(s)                     \
+    do {                                 \
+        (s)->v0 += (s)->v1;              \
+        (s)->v1 = SIP_ROTL((s)->v1, 13); \
+        (s)->v1 ^= (s)->v0;              \
+        (s)->v0 = SIP_ROTL((s)->v0, 32); \
+        (s)->v2 += (s)->v3;              \
+        (s)->v3 = SIP_ROTL((s)->v3, 16); \
+        (s)->v3 ^= (s)->v2;              \
+        (s)->v0 += (s)->v3;              \
+        (s)->v3 = SIP_ROTL((s)->v3, 21); \
+        (s)->v3 ^= (s)->v0;              \
+        (s)->v2 += (s)->v1;              \
+        (s)->v1 = SIP_ROTL((s)->v1, 17); \
+        (s)->v1 ^= (s)->v2;              \
+        (s)->v2 = SIP_ROTL((s)->v2, 32); \
+    } while (0)
+
+static inline void sip_init(sip_t* s) {
+    pthread_once(&g_hkey_once, hkey_init);
+    s->v0 = 0x736f6d6570736575ull ^ g_hkey[0];
+    s->v1 = 0x646f72616e646f6dull ^ g_hkey[1];
+    s->v2 = 0x6c7967656e657261ull ^ g_hkey[0];
+    s->v3 = 0x7465646279746573ull ^ g_hkey[1];
+    s->tail = 0;
+    s->len = 0;
+}
+
+static inline void sip_block(sip_t* s, uint64_t m) {
+    s->v3 ^= m;
+    for (int i = 0; i < CORR_SIP_C_ROUNDS; i++) SIP_ROUND(s);
+    s->v0 ^= m;
+}
+
+static inline uint64_t sip_le64(const unsigned char* p) {
+    uint64_t m;
+    memcpy(&m, p, 8);
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    m = __builtin_bswap64(m);
+#endif
+    return m;
+}
+
+static void sip_update(sip_t* s, const void* data, size_t n) {
+    const unsigned char* p = (const unsigned char*)data;
+    unsigned fill = (unsigned)(s->len & 7u);
+    s->len += n;
+    if (fill) {
+        while (n > 0 && fill < 8) {
+            s->tail |= (uint64_t)*p++ << (8u * fill++);
+            n--;
+        }
+        if (fill < 8) return;
+        sip_block(s, s->tail);
+        s->tail = 0;
+    }
+    for (; n >= 8; p += 8, n -= 8) sip_block(s, sip_le64(p));
+    for (size_t i = 0; i < n; i++) s->tail |= (uint64_t)p[i] << (8u * i);
+}
+
+static uint64_t sip_final(sip_t* s) {
+    sip_block(s, s->tail | (s->len << 56));
+    s->v2 ^= 0xff;
+    for (int i = 0; i < CORR_SIP_D_ROUNDS; i++) SIP_ROUND(s);
+    return s->v0 ^ s->v1 ^ s->v2 ^ s->v3;
+}
+
+static uint64_t corr_hash(const void* data, size_t len) {
+    sip_t s;
+    sip_init(&s);
+    sip_update(&s, data, len);
+    return sip_final(&s);
+}
+
+/* Hash a group-key tuple: each value's bytes + a NUL separator so that
  * ("ab","c") and ("a","bc") differ. NULL components are impossible here (a
  * missing group-by field makes the whole event skip the correlation). */
 static uint64_t hash_group_key(const char* const* vals, size_t n) {
-    uint64_t h = 1469598103934665603ULL;
+    static const unsigned char sep = 0;
+    sip_t s;
+    sip_init(&s);
     for (size_t i = 0; i < n; i++) {
-        const char* v = vals[i];
-        size_t len = strlen(v);
-        for (size_t j = 0; j < len; j++) {
-            h ^= (unsigned char)v[j];
-            h *= 1099511628211ULL;
-        }
-        h ^= 0x00; /* component separator */
-        h *= 1099511628211ULL;
+        sip_update(&s, vals[i], strlen(vals[i]));
+        sip_update(&s, &sep, 1);
     }
-    return h;
+    return sip_final(&s);
 }
 
 static int group_key_eq(const char* const* a, const char* const* b, size_t n) {
@@ -387,7 +490,7 @@ static uint32_t dset_observe(
     }
 
     size_t len = strlen(val);
-    uint64_t h = fnv1a(val, len);
+    uint64_t h = corr_hash(val, len);
     dval_t* hit = dset_find(d, val, len, h);
     if (hit) {
         hit->ts = ts;
