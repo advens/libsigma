@@ -223,12 +223,9 @@ struct group {
     double last_update;
     double fired_until; /* re-fire suppression deadline */
 
-    /* Merge accumulators from CORR_CONTRIB_{COUNT,SUM,SEEN}. Additive with the
-     * local ring / seen-set so a remote partial does not have to replay events. */
-    double merge_sum;
-    uint32_t merge_n;
-    uint64_t merge_seen;
-    uint8_t merge_remote; /* set when a remote COUNT/SUM/SEEN/DISTINCT merged */
+    /* A remote COUNT/SUM/SEEN/DISTINCT merged. Partials go into the same ring,
+     * seen set and distinct set as local events, so they age with the window. */
+    uint8_t merge_remote;
 
     /* temporal_ordered watermark buffer (event-time slack). */
     struct {
@@ -876,8 +873,8 @@ static void ev_prune(group_t* g, double window_start) {
     }
 }
 
-static int eval_event_count(const corr_rule_t* r, group_t* g, double now, double window_start, corr_stats_t* stats) {
-    /* Append now; bound the ring (drop oldest); then prune out-of-window. */
+/* Append now to the ts ring, overwriting the oldest entry when full. */
+static void ev_push_ts(group_t* g, double now, double window_start, corr_stats_t* stats) {
     if (g->ev_len == g->ev_cap) {
         double oldest = g->ev_ts[g->ev_head];
         g->ev_ts[g->ev_head] = now; /* overwrite oldest */
@@ -892,8 +889,12 @@ static int eval_event_count(const corr_rule_t* r, group_t* g, double now, double
         g->ev_ts[tail] = now;
         g->ev_len++;
     }
+}
+
+static int eval_event_count(const corr_rule_t* r, group_t* g, double now, double window_start, corr_stats_t* stats) {
+    ev_push_ts(g, now, window_start, stats);
     ev_prune(g, window_start);
-    return cmp_threshold((int64_t)g->ev_len + (int64_t)g->merge_n, r->cond_op, r->cond_count);
+    return cmp_threshold((int64_t)g->ev_len, r->cond_op, r->cond_count);
 }
 
 static int eval_value_count(const corr_rule_t* r,
@@ -972,6 +973,23 @@ static int ev_push_val(group_t* g, double now, double val, double window_start, 
     return 1;
 }
 
+/* Sum or average of the live ring; value_avg never fires on an empty window. */
+static int sum_avg_fires(const corr_rule_t* r, const group_t* g, int is_avg, double* out_agg) {
+    double sum = 0.0;
+    uint32_t n = g->ev_val != NULL ? g->ev_len : 0;
+    for (uint32_t i = 0; i < n; i++) sum += g->ev_val[(g->ev_head + i) % g->ev_cap];
+    if (is_avg) {
+        if (n == 0) {
+            *out_agg = 0.0;
+            return 0;
+        }
+        *out_agg = sum / (double)n;
+    } else {
+        *out_agg = sum;
+    }
+    return cond_satisfied_f(r->cond_op, *out_agg, (double)r->cond_count);
+}
+
 /* value_sum (is_avg=0) / value_avg (is_avg=1): aggregate the numeric value_field
  * over the live window. A non-numeric value is counted (values_nonnumeric) and
  * skipped from the aggregate, never coerced to 0. Recomputes over the live ring
@@ -993,21 +1011,7 @@ static int eval_value_sum_avg(const corr_rule_t* r,
         if (stats) CS_INC(stats, values_nonnumeric);
         ev_prune(g, window_start); /* age the window even when this value is skipped */
     }
-    double sum = g->merge_sum;
-    if (g->ev_val != NULL) {
-        for (uint32_t i = 0; i < g->ev_len; i++) sum += g->ev_val[(g->ev_head + i) % g->ev_cap];
-    }
-    if (is_avg) {
-        uint32_t n = g->ev_len + g->merge_n;
-        if (n == 0) {
-            *out_agg = 0.0;
-            return 0; /* no fire on empty average */
-        }
-        *out_agg = sum / (double)n;
-    } else {
-        *out_agg = sum;
-    }
-    return cond_satisfied_f(r->cond_op, *out_agg, (double)r->cond_count);
+    return sum_avg_fires(r, g, is_avg, out_agg);
 }
 
 static int cmp_dbl_asc(const void* a, const void* b) {
@@ -1015,7 +1019,7 @@ static int cmp_dbl_asc(const void* a, const void* b) {
     return (da > db) - (da < db);
 }
 
-/* Exact P_k from the live ring (nearest-rank). merge_sum/n are ignored: a
+/* Exact P_k from the live ring (nearest-rank). Remote partials do not apply: a
  * remote percentile merge needs a t-digest, which is a later transport path.
  * Empty window never fires. */
 static int eval_value_percentile(const corr_rule_t* r,
@@ -1280,7 +1284,7 @@ static int corr_cond_eval(const corr_ctok_t* c, size_t n, uint64_t seen_mask) {
 /* bit i set iff base_rule_ids[i] is currently in the group's (expired) seen set.
  * O(n_base * n_seen), both bounded by CORR_MAX_SEEN_RULES (64). */
 static uint64_t corr_seen_mask(const corr_rule_t* r, const group_t* g) {
-    uint64_t mask = g->merge_seen;
+    uint64_t mask = 0;
     size_t nb = r->n_base_rule_ids < 64 ? r->n_base_rule_ids : 64;
     for (size_t i = 0; i < nb; i++) {
         uint32_t want = r->base_rule_ids[i];
@@ -1696,7 +1700,7 @@ int corr_on_event_apply(corr_engine_t* e,
                 observed_val = (int64_t)vagg; /* aggregate, truncated for the int64 observed field */
                 observed_vfield = r->value_field;
             } else if (r->type == CORR_EVENT_COUNT) {
-                observed_val = (int64_t)gs->ev_len + (int64_t)gs->merge_n;
+                observed_val = (int64_t)gs->ev_len;
             } else if (r->type == CORR_BEACONING) {
                 observed_val = (int64_t)gs->ev_len; /* beaconing: events in the periodic window */
             } else {
@@ -1776,6 +1780,9 @@ int corr_on_contribution(corr_engine_t* e,
     corr_state_t* st = corr_state_by_id(e, c->corr_id);
     if (!st) return 0;
     const corr_rule_t* r = st->rule;
+    /* A partial only means something to the type that emits it, and the ring
+     * layout differs per type (ev_val only exists for value_sum/avg). */
+    if ((int)c->kind != corr_contrib_kind_for(r->type)) return 0;
     if (c->n_group != r->n_group_by) {
         CS_INC(&e->stats, event_skipped_missing_field);
         return 0;
@@ -1801,45 +1808,41 @@ int corr_on_contribution(corr_engine_t* e,
     gs->last_update = ts;
     gs->merge_remote = 1;
 
+    /* A partial of n events lands in the ring as n entries at ts. More than
+     * the ring holds would overwrite itself, so n is capped at ev_cap. */
+    uint32_t n = c->count ? c->count : 1u;
+    if (n > gs->ev_cap) n = gs->ev_cap;
     int fired_now = 0;
     double vagg = 0.0;
     switch (c->kind) {
-        case CORR_CONTRIB_COUNT: {
-            uint32_t add = c->count ? c->count : 1u;
-            gs->merge_n += add;
+        case CORR_CONTRIB_COUNT:
+            for (uint32_t i = 0; i < n; i++) ev_push_ts(gs, ts, window_start, &e->stats);
             ev_prune(gs, window_start);
-            if (r->type == CORR_EVENT_COUNT)
-                fired_now = cmp_threshold((int64_t)gs->ev_len + (int64_t)gs->merge_n, r->cond_op, r->cond_count);
+            fired_now = cmp_threshold((int64_t)gs->ev_len, r->cond_op, r->cond_count);
             break;
-        }
         case CORR_CONTRIB_SUM: {
-            gs->merge_sum += c->numeric;
-            gs->merge_n += c->count ? c->count : 1u;
+            /* Spread the sum over the n entries: the window sum stays exact,
+             * and the average counts the n remote events. */
+            const double each = c->numeric / (double)n;
+            for (uint32_t i = 0; i < n; i++)
+                if (!ev_push_val(gs, ts, each, window_start, &e->stats)) break;
             ev_prune(gs, window_start);
-            if (r->type == CORR_VALUE_SUM || r->type == CORR_VALUE_AVG) {
-                double sum = gs->merge_sum;
-                if (gs->ev_val != NULL) {
-                    for (uint32_t i = 0; i < gs->ev_len; i++) sum += gs->ev_val[(gs->ev_head + i) % gs->ev_cap];
-                }
-                uint32_t n = gs->ev_len + gs->merge_n;
-                if (r->type == CORR_VALUE_AVG) {
-                    if (n == 0) break;
-                    vagg = sum / (double)n;
-                } else {
-                    vagg = sum;
-                }
-                fired_now = cond_satisfied_f(r->cond_op, vagg, (double)r->cond_count);
-            }
+            fired_now = sum_avg_fires(r, gs, r->type == CORR_VALUE_AVG, &vagg);
             break;
         }
         case CORR_CONTRIB_DISTINCT:
-            if (r->type == CORR_VALUE_COUNT && c->value != NULL)
+            if (c->value != NULL)
                 fired_now = eval_value_count(r, gs, c->value, e->caps.max_distinct, ts, window_start, &e->stats);
             break;
-        case CORR_CONTRIB_SEEN:
-            gs->merge_seen |= c->seen_mask;
-            if (r->type == CORR_TEMPORAL) fired_now = eval_temporal(r, gs, NULL, 0, ts, window_start, &e->stats);
+        case CORR_CONTRIB_SEEN: {
+            uint32_t rids[CORR_MAX_SEEN_RULES];
+            size_t n_rids = 0;
+            size_t nb = r->n_base_rule_ids < CORR_MAX_SEEN_RULES ? r->n_base_rule_ids : CORR_MAX_SEEN_RULES;
+            for (size_t i = 0; i < nb; i++)
+                if (c->seen_mask & (1ull << i)) rids[n_rids++] = r->base_rule_ids[i];
+            fired_now = eval_temporal(r, gs, rids, n_rids, ts, window_start, &e->stats);
             break;
+        }
         case CORR_CONTRIB_EVENT:
         default:
             break;
@@ -1864,7 +1867,7 @@ int corr_on_contribution(corr_engine_t* e,
         observed_val = (int64_t)vagg;
         observed_vfield = r->value_field;
     } else if (r->type == CORR_EVENT_COUNT) {
-        observed_val = (int64_t)gs->ev_len + (int64_t)gs->merge_n;
+        observed_val = (int64_t)gs->ev_len;
     } else {
         observed_val = (int64_t)r->n_base_rule_ids;
     }
