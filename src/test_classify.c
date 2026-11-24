@@ -1366,6 +1366,56 @@ static void test_contrib_ages(void) {
     }
 }
 
+/* The ring starts small and doubles. Growth must keep every live entry in
+ * order, also when the head has wrapped, for the time ring and the value ring
+ * that moves with it. At the cap the oldest entry is overwritten. */
+static void test_ring_growth(void) {
+    corr_fire_t f;
+    /* event_count: 50 events 1 s apart (wraps a 16-slot ring), then a burst. */
+    {
+        corr_rule_t r = mk_event_count();
+        r.cond_count = 100;
+        r.timespan_s = 10;
+        corr_engine_t* e = corr_engine_new(&r, 1, corr_caps_default());
+        int early = 0, at = -1;
+        for (int i = 0; i < 50; i++) early += feed(e, "203.0.113.9", "root", BASE_1, 1, (double)i, NULL);
+        for (int k = 0; k < 120 && at < 0; k++) {
+            memset(&f, 0, sizeof(f));
+            if (feed(e, "203.0.113.9", "root", BASE_1, 1, 50.0, &f) == 1) at = k;
+        }
+        /* window [40, 50]: ten earlier events, so the 90th of the burst fires */
+        CHECK(early == 0 && at == 89, "ring: count crosses growth with a wrapped head");
+        CHECK(f.observed == 100, "ring: observed count after growth is exact");
+        corr_engine_free(e);
+    }
+    /* value_sum: the value ring grows in lockstep. */
+    {
+        corr_rule_t r = mk_value_sum();
+        r.cond_count = 150;
+        r.timespan_s = 10;
+        corr_engine_t* e = corr_engine_new(&r, 1, corr_caps_default());
+        int early = 0, at = -1;
+        for (int i = 0; i < 50; i++) early += feed_num(e, "203.0.113.9", "destination.bytes", "1", (double)i, NULL);
+        for (int k = 0; k < 200 && at < 0; k++)
+            if (feed_num(e, "203.0.113.9", "destination.bytes", "1", 50.0, NULL) == 1) at = k;
+        CHECK(early == 0 && at == 139, "ring: value sum crosses growth with a wrapped head");
+        corr_engine_free(e);
+    }
+    /* at the cap the oldest entry is overwritten and counted */
+    {
+        corr_rule_t r = mk_event_count();
+        r.cond_count = 1000;
+        corr_caps_t caps = corr_caps_default();
+        caps.max_events_per_group = 16;
+        corr_engine_t* e = corr_engine_new(&r, 1, caps);
+        for (int i = 0; i < 40; i++) feed(e, "203.0.113.9", "root", BASE_1, 1, 100.0, NULL);
+        corr_stats_t st;
+        corr_engine_stats(e, &st);
+        CHECK(st.events_overwritten == 24, "ring: 40 events into a 16-slot cap overwrite 24");
+        corr_engine_free(e);
+    }
+}
+
 int main(void) {
     test_event_count();
     test_value_count();
@@ -1392,6 +1442,7 @@ int main(void) {
     test_beaconing();
     test_beaconing_bucketed();
     test_group_by_aliases();
+    test_ring_growth();
     test_receive_clock();
 
     printf("\nlibsigma correlation engine: %d passed, %d failed\n", g_pass, g_fail);
