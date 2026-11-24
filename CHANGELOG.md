@@ -39,6 +39,11 @@ are unchanged.
   Partials now go into the group's event ring and seen set at their event
   time and expire with the window. A partial whose kind does not match the
   correlation type is refused.
+- `corr_contrib_from_json` took numbers as they came: `"count":-1` became
+  4294967295, and NaN or Infinity in `ts` or `numeric` went to the engine.
+  It now requires a finite `ts`, a `group` of strings no longer than the
+  caller's slots, a `count` from 1 to 4096, a finite SUM `numeric`, a
+  non-zero SEEN mask, and a DISTINCT `value`. Anything else is `-1`.
 
 ## [4.1.1] - 2026-11-16
 

@@ -4,6 +4,7 @@
 #include "contrib_wire.h"
 
 #include <limits.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -114,6 +115,19 @@ json_object* corr_contrib_to_json(const corr_contrib_t* c, const char* origin) {
     return j;
 }
 
+/* Largest count one partial may carry: the default event ring, which is all
+ * the engine can hold for a group. An emitter sends 1. */
+#define CONTRIB_MAX_COUNT 4096
+
+/* A JSON number that is finite. json-c parses NaN and Infinity. */
+static int get_finite(json_object* f, double* out) {
+    if (!json_object_is_type(f, json_type_double) && !json_object_is_type(f, json_type_int)) return -1;
+    double v = json_object_get_double(f);
+    if (!isfinite(v)) return -1;
+    *out = v;
+    return 0;
+}
+
 int corr_contrib_from_json(json_object* j, corr_contrib_t* out, const char** group_slots, size_t group_slots_cap) {
     json_object* f;
     const char* kn;
@@ -129,21 +143,45 @@ int corr_contrib_from_json(json_object* j, corr_contrib_t* out, const char** gro
     if (kind_parse(kn, &out->kind) != 0) return -1;
     if (!json_object_object_get_ex(j, "corr_id", &f) || !json_object_is_type(f, json_type_string)) return -1;
     out->corr_id = json_object_get_string(f);
-    if (json_object_object_get_ex(j, "ts", &f)) out->ts = json_object_get_double(f);
-    if (json_object_object_get_ex(j, "group", &f) && json_object_is_type(f, json_type_array)) {
-        n = (size_t)json_object_array_length(f);
-        if (n > group_slots_cap) n = group_slots_cap;
-        for (i = 0; i < n; i++) {
-            json_object* e = json_object_array_get_idx(f, (int)i);
-            group_slots[i] = e ? json_object_get_string(e) : "";
-        }
-        out->group_vals = group_slots;
-        out->n_group = n;
+    if (!json_object_object_get_ex(j, "ts", &f) || get_finite(f, &out->ts) != 0) return -1;
+    /* A group that is cut short or retyped would merge into another group. */
+    if (!json_object_object_get_ex(j, "group", &f) || !json_object_is_type(f, json_type_array)) return -1;
+    n = (size_t)json_object_array_length(f);
+    if (n > group_slots_cap) return -1;
+    for (i = 0; i < n; i++) {
+        json_object* e = json_object_array_get_idx(f, (int)i);
+        if (!json_object_is_type(e, json_type_string)) return -1;
+        group_slots[i] = json_object_get_string(e);
     }
-    if (json_object_object_get_ex(j, "count", &f)) out->count = (uint32_t)json_object_get_int64(f);
-    if (json_object_object_get_ex(j, "numeric", &f)) out->numeric = json_object_get_double(f);
-    if (json_object_object_get_ex(j, "seen_mask", &f)) out->seen_mask = (uint64_t)json_object_get_int64(f);
-    if (json_object_object_get_ex(j, "value", &f) && json_object_is_type(f, json_type_string))
-        out->value = json_object_get_string(f);
+    out->group_vals = group_slots;
+    out->n_group = n;
+    if (out->kind == CORR_CONTRIB_COUNT || out->kind == CORR_CONTRIB_SUM) {
+        if (json_object_object_get_ex(j, "count", &f)) {
+            if (!json_object_is_type(f, json_type_int)) return -1;
+            int64_t v = json_object_get_int64(f);
+            if (v < 1 || v > CONTRIB_MAX_COUNT) return -1;
+            out->count = (uint32_t)v;
+        }
+    }
+    switch (out->kind) {
+        case CORR_CONTRIB_COUNT:
+            break;
+        case CORR_CONTRIB_SUM:
+            if (!json_object_object_get_ex(j, "numeric", &f) || get_finite(f, &out->numeric) != 0) return -1;
+            break;
+        case CORR_CONTRIB_SEEN:
+            /* The encoder writes the mask as int64, so bit 63 reads negative. */
+            if (!json_object_object_get_ex(j, "seen_mask", &f) || !json_object_is_type(f, json_type_int)) return -1;
+            out->seen_mask = (uint64_t)json_object_get_int64(f);
+            if (out->seen_mask == 0) return -1;
+            break;
+        case CORR_CONTRIB_DISTINCT:
+            if (!json_object_object_get_ex(j, "value", &f) || !json_object_is_type(f, json_type_string)) return -1;
+            out->value = json_object_get_string(f);
+            break;
+        case CORR_CONTRIB_EVENT:
+        default:
+            return -1;
+    }
     return 0;
 }
