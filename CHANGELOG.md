@@ -68,6 +68,12 @@ are unchanged.
   correlation lock. They now use SipHash-1-3 under a random per-process key.
   The owner hash (`corr_owner_index`) is unchanged: peers must agree on it.
   The wasm module keys from the clock and takes no new import.
+- Every correlation group allocated its full event ring (32 KiB at the
+  default cap), its temporal tables and its watermark buffer up front, for
+  every type, so 50000 groups of one correlation took 375 MiB whatever they
+  held. The ring now starts at 8 entries and doubles up to the cap, and the
+  ring, the distinct set, the seen tables and the watermark buffer are
+  allocated by the types that use them: the same 50000 groups take 17 MiB.
 
 ## [4.1.1] - 2026-11-16
 

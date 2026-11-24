@@ -72,6 +72,7 @@
  * buckets; the warm detector uses 168 (7 days hourly). */
 #define CORR_BEACON_MAX_BUCKETS 1024
 #define CORR_WM_CAP 32 /* temporal_ordered pending events under watermark slack */
+#define CORR_RING_MIN 8u /* first ring allocation; doubles up to max_events_per_group */
 
 /* ============================================================================
  * tier_for_correlation + tier helpers
@@ -293,9 +294,11 @@ struct group {
     char** key; /* owned copies of the group-by VALUES (n_group_by) */
     size_t n_key;
 
-    /* event_count: ring buffer of monotonic timestamps. */
-    double* ev_ts; /* capacity = max_events_per_group */
-    uint32_t ev_cap;
+    /* event_count / value / beaconing raw: ring of event times. Allocated on
+     * the first push, doubled up to ev_max, then the oldest is overwritten. */
+    double* ev_ts;
+    uint32_t ev_cap; /* allocated slots, 0 until the first push */
+    uint32_t ev_max; /* max_events_per_group */
     uint32_t ev_head; /* index of oldest */
     uint32_t ev_len;
 
@@ -313,9 +316,12 @@ struct group {
     /* value_count distinct set. */
     dset_t distinct;
 
-    /* temporal: per base rid latest in-window ts (parallel arrays). */
-    uint32_t seen_rid[CORR_MAX_SEEN_RULES];
-    double seen_ts[CORR_MAX_SEEN_RULES];
+    /* temporal: per base rid latest in-window ts, allocated on the first
+     * recorded rid (only temporal and conditioned temporal_ordered use it). */
+    struct seen_tab {
+        uint32_t rid[CORR_MAX_SEEN_RULES];
+        double ts[CORR_MAX_SEEN_RULES];
+    }* seen;
     uint32_t n_seen;
 
     /* temporal_ordered: run[k] completed steps 0..k (n-1 entries, lazily
@@ -331,11 +337,12 @@ struct group {
      * seen set and distinct set as local events, so they age with the window. */
     uint8_t merge_remote;
 
-    /* temporal_ordered watermark buffer (event-time slack). */
-    struct {
+    /* temporal_ordered watermark buffer (event-time slack), CORR_WM_CAP
+     * entries allocated on the first buffered hit. */
+    struct wm_ent {
         double ts;
         uint32_t rid;
-    } wm[CORR_WM_CAP];
+    }* wm;
     uint32_t wm_n;
     double wm_max_ts;
 
@@ -492,6 +499,10 @@ static uint32_t dset_observe(
         e = nx;
     }
 
+    if (d->buckets == NULL && dset_init(d) != 0) {
+        if (stats) CS_INC(stats, oom_dropped);
+        return d->count;
+    }
     size_t len = strlen(val);
     uint64_t h = corr_hash(val, len);
     dval_t* hit = dset_find(d, val, len, h);
@@ -564,6 +575,8 @@ static void group_free(group_t* g) {
     free(g->ev_val); /* NULL unless this was a value_sum/avg group */
     free(g->bbuckets); /* NULL unless this was a bucketed-beaconing group */
     free(g->ord); /* NULL unless this was a temporal_ordered group */
+    free(g->seen);
+    free(g->wm);
     dset_free(&g->distinct);
     free(g);
 }
@@ -589,16 +602,9 @@ static group_t* group_new(const char* const* vals, size_t n, uint64_t h, uint32_
             memcpy(g->key[i], vals[i], len + 1);
         }
     }
-    g->ev_cap = ev_cap ? ev_cap : 1;
-    g->ev_ts = malloc(sizeof(double) * g->ev_cap);
-    if (!g->ev_ts) {
-        group_free(g);
-        return NULL;
-    }
-    if (dset_init(&g->distinct) != 0) {
-        group_free(g);
-        return NULL;
-    }
+    /* The ring and the distinct set are allocated by the types that use them,
+     * on first use. */
+    g->ev_max = ev_cap ? ev_cap : 1;
     return g;
 }
 
@@ -978,8 +984,51 @@ static void ev_prune(group_t* g, double window_start) {
     }
 }
 
+/* Move the ring to nc slots, oldest entry first. The value ring comes along
+ * when it exists or with_val asks for it. */
+static int ev_resize(group_t* g, uint32_t nc, int with_val) {
+    const int vals = with_val || g->ev_val != NULL;
+    double* ts = malloc(sizeof(double) * nc);
+    double* val = vals ? calloc(nc, sizeof(double)) : NULL;
+    if (ts == NULL || (vals && val == NULL)) {
+        free(ts);
+        free(val);
+        return -1;
+    }
+    for (uint32_t i = 0; i < g->ev_len; i++) {
+        uint32_t k = (g->ev_head + i) % g->ev_cap;
+        ts[i] = g->ev_ts[k];
+        if (g->ev_val != NULL) val[i] = g->ev_val[k];
+    }
+    free(g->ev_ts);
+    free(g->ev_val);
+    g->ev_ts = ts;
+    g->ev_val = val;
+    g->ev_head = 0;
+    g->ev_cap = nc;
+    return 0;
+}
+
+/* Make room for one more entry: grow a full ring (8, then doubling) until it
+ * reaches ev_max, after which the push overwrites the oldest entry. Returns 0
+ * when there is no usable ring (allocation failed, counted). */
+static int ev_make_room(group_t* g, int with_val, corr_stats_t* stats) {
+    const int grow = g->ev_len == g->ev_cap && g->ev_cap < g->ev_max;
+    const int need_val = with_val && g->ev_val == NULL;
+    if (!grow && !need_val) return 1;
+    uint32_t nc = g->ev_cap;
+    if (grow) {
+        nc = g->ev_cap ? g->ev_cap * 2u : CORR_RING_MIN;
+        if (nc > g->ev_max || nc <= g->ev_cap) nc = g->ev_max;
+    }
+    if (ev_resize(g, nc, with_val) == 0) return 1;
+    if (stats) CS_INC(stats, oom_dropped);
+    return g->ev_cap > 0 && !need_val; /* full ring: overwrite the oldest */
+}
+
 /* Append now to the ts ring, overwriting the oldest entry when full. */
 static void ev_push_ts(group_t* g, double now, double window_start, corr_stats_t* stats) {
+    if (!ev_make_room(g, 0, stats)) return;
     if (g->ev_len == g->ev_cap) {
         double oldest = g->ev_ts[g->ev_head];
         g->ev_ts[g->ev_head] = now; /* overwrite oldest */
@@ -1047,18 +1096,12 @@ static int cond_satisfied_f(corr_op_t op, double val, double thr) {
     return val >= thr;
 }
 
-/* Push (now, val) into the parallel ts/value rings (lazy-allocating ev_val on
- * first use, so only value_sum/avg groups pay), bounded by max_events_per_group,
- * then prune out-of-window. Mirrors eval_event_count's ring discipline so the
- * two arrays index in lockstep. Returns 0 on OOM allocating ev_val. */
+/* Push (now, val) into the parallel ts/value rings (the value ring exists only
+ * for the value types and grows with the ts ring), bounded by
+ * max_events_per_group, then prune out-of-window. The two arrays index in
+ * lockstep. Returns 0 when no ring could be allocated. */
 static int ev_push_val(group_t* g, double now, double val, double window_start, corr_stats_t* stats) {
-    if (g->ev_val == NULL) {
-        g->ev_val = malloc(sizeof(double) * g->ev_cap);
-        if (g->ev_val == NULL) {
-            if (stats) CS_INC(stats, oom_dropped);
-            return 0;
-        }
-    }
+    if (!ev_make_room(g, 1, stats)) return 0;
     if (g->ev_len == g->ev_cap) {
         double oldest = g->ev_ts[g->ev_head];
         g->ev_ts[g->ev_head] = now; /* overwrite oldest */
@@ -1176,6 +1219,10 @@ static int eval_value_percentile(const corr_rule_t* r,
  * cadence, but bounded to the events that fit the ring. */
 static int eval_beaconing_raw(const corr_rule_t* r, group_t* g, double now, double window_start, corr_stats_t* stats) {
     /* append now; bound the ring (drop oldest); prune out-of-window */
+    if (!ev_make_room(g, 0, stats)) {
+        ev_prune(g, window_start);
+        return 0;
+    }
     if (g->ev_len == g->ev_cap) {
         g->ev_ts[g->ev_head] = now; /* overwrite oldest */
         g->ev_head = (g->ev_head + 1) % g->ev_cap;
@@ -1324,14 +1371,18 @@ static void temporal_record_seen(
         uint32_t rid = hit_rids[i];
         uint32_t k;
         for (k = 0; k < g->n_seen; k++)
-            if (g->seen_rid[k] == rid) {
-                g->seen_ts[k] = now;
+            if (g->seen->rid[k] == rid) {
+                g->seen->ts[k] = now;
                 break;
             }
         if (k == g->n_seen) {
+            if (g->seen == NULL && (g->seen = malloc(sizeof(*g->seen))) == NULL) {
+                if (stats) CS_INC(stats, oom_dropped);
+                break;
+            }
             if (g->n_seen < CORR_MAX_SEEN_RULES) {
-                g->seen_rid[g->n_seen] = rid;
-                g->seen_ts[g->n_seen] = now;
+                g->seen->rid[g->n_seen] = rid;
+                g->seen->ts[g->n_seen] = now;
                 g->n_seen++;
             } else if (stats) {
                 /* Table full: a new base rid can't be recorded, so this
@@ -1343,9 +1394,9 @@ static void temporal_record_seen(
     /* Expire stale observations (compact in place). */
     uint32_t w = 0;
     for (uint32_t k = 0; k < g->n_seen; k++) {
-        if (g->seen_ts[k] >= window_start) {
-            g->seen_rid[w] = g->seen_rid[k];
-            g->seen_ts[w] = g->seen_ts[k];
+        if (g->seen->ts[k] >= window_start) {
+            g->seen->rid[w] = g->seen->rid[k];
+            g->seen->ts[w] = g->seen->ts[k];
             w++;
         }
     }
@@ -1394,7 +1445,7 @@ static uint64_t corr_seen_mask(const corr_rule_t* r, const group_t* g) {
     for (size_t i = 0; i < nb; i++) {
         uint32_t want = r->base_rule_ids[i];
         for (uint32_t k = 0; k < g->n_seen; k++)
-            if (g->seen_rid[k] == want) {
+            if (g->seen->rid[k] == want) {
                 mask |= (1ull << i);
                 break;
             }
@@ -1485,6 +1536,10 @@ static int eval_temporal_ordered(const corr_rule_t* r,
 }
 
 static void wm_insert(group_t* g, double ts, uint32_t rid, corr_stats_t* stats) {
+    if (g->wm == NULL && (g->wm = malloc(sizeof(*g->wm) * CORR_WM_CAP)) == NULL) {
+        if (stats) CS_INC(stats, oom_dropped);
+        return;
+    }
     if (g->wm_n >= CORR_WM_CAP) {
         /* drop the oldest pending item to admit the new one */
         uint32_t min_i = 0;
@@ -1918,9 +1973,9 @@ int corr_on_contribution(corr_engine_t* e,
     gs->merge_remote = 1;
 
     /* A partial of n events lands in the ring as n entries at ts. More than
-     * the ring holds would overwrite itself, so n is capped at ev_cap. */
+     * the ring holds would overwrite itself, so n is capped at ev_max. */
     uint32_t n = c->count ? c->count : 1u;
-    if (n > gs->ev_cap) n = gs->ev_cap;
+    if (n > gs->ev_max) n = gs->ev_max;
     int fired_now = 0;
     double vagg = 0.0;
     switch (c->kind) {
