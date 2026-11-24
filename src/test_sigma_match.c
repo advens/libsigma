@@ -1905,6 +1905,98 @@ static void test_v2_field_names_nul_terminated(void) {
     free(t);
 }
 
+/* Serialize db and load the bytes back; return the load status. */
+static int reload_rc(const sigma_db_t* db) {
+    uint8_t* buf = NULL;
+    size_t len = 0;
+    if (sigma_db_serialize(db, &buf, &len) != SIGMA_OK) return SIGMA_ERR_NOMEM;
+    sigma_db_t d;
+    memset(&d, 0, sizeof(d));
+    int rc = sigma_db_load_buffer(buf, len, &d);
+    if (rc == SIGMA_OK)
+        sigma_db_free(&d);
+    else
+        free(buf);
+    return rc;
+}
+
+/* One rule, one CIDR predicate on source.ip. */
+static int cidr_rc(uint8_t family, uint8_t prefix) {
+    tb_t* t = calloc(1, sizeof(*t));
+    assert(t);
+    uint32_t c = tb_cidr(t, family == 4 ? "192.0.2.0/24" : "2001:db8::/32");
+    t->cidrs[c].family = family;
+    t->cidrs[c].prefix = prefix;
+    uint32_t ps = t->db.n_preds;
+    tb_pred_cidr(t, "source.ip", c, 0);
+    tb_rule(t, 1, tb_sel(t, ps), 1, 0, 0, SIGMA_VERDICT_ALERT, 2, 20);
+    sigma_db_t db = tb_finish(t);
+    int rc = reload_rc(&db);
+    sigma_db_free(&db);
+    free(t);
+    return rc;
+}
+
+static void test_loader_rejects_bad_operands(void) {
+    CHECK(cidr_rc(4, 32) == SIGMA_OK, "operands: v4 /32 loads");
+    CHECK(cidr_rc(6, 128) == SIGMA_OK, "operands: v6 /128 loads");
+    CHECK(cidr_rc(4, 33) == SIGMA_ERR_RANGE, "operands: v4 /33 rejected");
+    CHECK(cidr_rc(6, 129) == SIGMA_ERR_RANGE, "operands: v6 /129 rejected");
+    CHECK(cidr_rc(5, 8) == SIGMA_ERR_RANGE, "operands: unknown CIDR family rejected");
+
+    /* Predicate op past SIGMA_OP__MAX. */
+    {
+        tb_t* t = calloc(1, sizeof(*t));
+        assert(t);
+        uint32_t ps = t->db.n_preds;
+        tb_pred_str(t, "url.path", SIGMA_OP_CONTAINS, "/admin", 0, 0);
+        tb_rule(t, 1, tb_sel(t, ps), 1, 0, 0, SIGMA_VERDICT_ALERT, 2, 20);
+        t->preds[ps].op = SIGMA_OP__MAX;
+        sigma_db_t db = tb_finish(t);
+        CHECK(reload_rc(&db) == SIGMA_ERR_RANGE, "operands: predicate op out of range rejected");
+        sigma_db_free(&db);
+        free(t);
+    }
+
+    /* Prefilter needles: two bytes is the minimum the fingerprint reads. */
+    for (int len = 1; len <= 2; len++) {
+        tb_t* t = calloc(1, sizeof(*t));
+        assert(t);
+        uint32_t ps = t->db.n_preds;
+        tb_pred_str(t, "url.path", SIGMA_OP_CONTAINS, len == 1 ? "a" : "ab", 0, 0);
+        uint32_t r = tb_rule(t, 1, tb_sel(t, ps), 1, 0, 0, SIGMA_VERDICT_ALERT, 2, 20);
+        uint32_t ids[] = {r};
+        tb_litndl(t, len == 1 ? "a" : "ab", ids, 1);
+        sigma_db_t db = tb_finish(t);
+        int rc = reload_rc(&db);
+        if (len == 1)
+            CHECK(rc == SIGMA_ERR_RANGE, "operands: one-byte needle rejected");
+        else
+            CHECK(rc == SIGMA_OK, "operands: two-byte needle loads");
+        sigma_db_free(&db);
+        free(t);
+    }
+
+    /* 0xFFFF fields would make the last field id equal to ANY_FIELD. */
+    {
+        static char pool[] = "f";
+        const uint32_t nf = SIGMA_LITREF_ANY_FIELD + 1u;
+        sigma_str_t* fields = malloc(nf * sizeof(*fields));
+        assert(fields);
+        for (uint32_t i = 0; i < nf; i++) fields[i] = (sigma_str_t){0, 1};
+        sigma_db_t db;
+        memset(&db, 0, sizeof(db));
+        db.fields = fields;
+        db.strpool = pool;
+        db.strpool_len = sizeof(pool);
+        db.n_fields = nf - 1u;
+        CHECK(reload_rc(&db) == SIGMA_OK, "operands: 0xFFFF fields load");
+        db.n_fields = nf;
+        CHECK(reload_rc(&db) == SIGMA_ERR_RANGE, "operands: 0x10000 fields rejected");
+        free(fields);
+    }
+}
+
 int main(void) {
     tb_t* t = calloc(1, sizeof(*t));
     assert(t);
@@ -1967,6 +2059,7 @@ int main(void) {
     test_route_parser_stamp();
     test_wrong_version_rejected();
     test_v2_field_names_nul_terminated();
+    test_loader_rejects_bad_operands();
     /* SIMD literal prefilter soundness + narrowing. */
     test_prefilter();
     test_prefilter_cnf();
