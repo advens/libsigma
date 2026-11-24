@@ -16,6 +16,10 @@ is called out explicitly.
   past 32 (v4) or 128 (v6), a predicate op past `SIGMA_OP__MAX`, a prefilter
   needle shorter than 2 bytes, and more than 0xFFFF fields. A v6 prefix of
   129 used to load and read past the address at match time.
+- Percentile and median correlations shared one sort buffer across the
+  engine, while each correlation only holds its own lock. Two workers on two
+  such correlations wrote the same buffer and could fire on the other's
+  values. Each percentile or median correlation now owns its buffer.
 
 ## [4.1.1] - 2026-11-16
 
