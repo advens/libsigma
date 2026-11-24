@@ -929,13 +929,16 @@ static inline void eval_bucket_prefiltered(sigma_eval_t* e,
     }
 }
 
-/* Resolve the bucket index whose key equals the event's category (NUL-free
- * compare against the strpool key).  Returns UINT32_MAX if none matches.
- * Always-verify (empty key) is NOT returned here, it is run unconditionally. */
+/* Resolve the bucket index whose key equals a route token, ASCII case
+ * folded on both sides: a token that matches no key prunes every rule outside
+ * always-verify, so "Nginx" must find "nginx". Returns UINT32_MAX if none
+ * matches. Always-verify (empty key) is NOT returned here, it is run
+ * unconditionally. */
 static uint32_t find_category_bucket(const sigma_db_t* db, const char* cat, size_t cat_len) {
+    if (cat_len == 0) return UINT32_MAX;
     for (uint32_t i = 0; i < db->n_buckets; i++) {
         const sigma_str_t* k = &db->bucket_keys[i];
-        if (k->len == cat_len && cat_len > 0 && memcmp(db->strpool + k->off, cat, cat_len) == 0) return i;
+        if (sg_eq(db->strpool + k->off, k->len, cat, cat_len, false)) return i;
     }
     return UINT32_MAX;
 }
@@ -978,6 +981,10 @@ int sigma_eval_run(sigma_eval_t* e, sigma_field_fn fn, void* ctx, sigma_hit_t* o
      * `technology` is a leftover alias. observer.product,
      * event.provider, event.module, event.dataset, and
      * log.syslog.appname keep older events working.
+     *
+     * The bucket index is a logsource filter: a token that names no bucket
+     * leaves only always-verify. The host must fill these fields from its
+     * parser, never from message content, or the sender picks the rules.
      *
      * No route field at all -> full linear scan. */
     if (db->n_buckets) {

@@ -236,7 +236,11 @@ To compile one rule `image|endswith '\mimikatz.exe' and CommandLine|contains
    `technology`, then the older ECS aliases `observer.product` /
    `event.provider` / `event.module` / `event.dataset` /
    `log.syslog.appname`. It unions every bucket those keys hit; a rule in two
-   matching buckets is verified once.
+   matching buckets is verified once. Keys compare ASCII case-insensitively.
+   The index is a logsource filter, not only an accelerator: an event whose
+   route fields name no bucket runs only the always-verify rules, and an event
+   with no route field runs every rule. Fill the route fields from the host's
+   parser, never from message content, or a sender chooses which rules run.
 6. **(optional) litidx:** for large buckets, derive each rule's necessary-atom
    CNF (a conjunction of clauses). String atoms (min length 3) post as
    `sigma_litref_t` needles; numeric and CIDR atoms post as `sigma_fwit_t`.

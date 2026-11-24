@@ -10,6 +10,13 @@ is called out explicitly.
 
 ## [Unreleased]
 
+### Fixed
+
+- Bucket keys were compared case-sensitively, and a route token that names
+  no bucket leaves only the always-verify rules. A parser that stamped
+  `product="Nginx"` or `event.category="Web"` silently skipped every rule
+  of that logsource. Keys now compare ASCII case-insensitively.
+
 ## [4.1.1] - 2026-11-16
 
 PATCH: a bounds fix. The C ABI, the SONAME (`libsigma.so.4`), the `.sigmac`
