@@ -56,10 +56,9 @@ typedef struct {
  * exist but are not tuned for this. The limits below are generous
  * relative to real Sigma `|re` patterns and field lengths (JIT-compiled,
  * see sigma_db_finalize): a legitimate match returns well under them; an
- * adversarial one is capped rather than left unbounded. pcre2_match()
- * already treats any negative return (PCRE2_ERROR_NOMATCH included) as
- * "this predicate did not match", so a limit hit degrades to a normal,
- * safe non-match with no separate handling needed.
+ * adversarial one is capped rather than left unbounded. A limit hit does
+ * not say whether the pattern matches: pred_match returns TV_UNKNOWN, and a
+ * rule whose condition is unknown fires (see rule_match).
  *
  * Fixed policy, not derived from any db, so ONE lazily-built context is
  * shared read-only across every thread and every sigma_db_t -- avoiding
@@ -70,6 +69,7 @@ typedef struct {
  * leaked) at exit. */
 #define SIGMA_RE_MATCH_LIMIT 100000u
 #define SIGMA_RE_DEPTH_LIMIT 10000u
+#define SIGMA_RE_HEAP_LIMIT_KIB 16384u
 
 static pthread_once_t g_re_mctx_once = PTHREAD_ONCE_INIT;
 static pcre2_match_context* g_re_mctx = NULL;
@@ -79,6 +79,7 @@ static void sigma_re_mctx_init(void) {
     if (g_re_mctx) {
         pcre2_set_match_limit(g_re_mctx, SIGMA_RE_MATCH_LIMIT);
         pcre2_set_depth_limit(g_re_mctx, SIGMA_RE_DEPTH_LIMIT);
+        pcre2_set_heap_limit(g_re_mctx, SIGMA_RE_HEAP_LIMIT_KIB);
     }
     /* On allocation failure g_re_mctx stays NULL; pcre2_match() already
      * accepts a NULL context (today's behavior), so this degrades safely
@@ -110,6 +111,7 @@ struct sigma_eval {
     uint16_t cur_field; /* field being scanned, for the postings callback */
     sigma_teddy_scratch_t tscr; /* per-field needle-confirmation stamps */
     sigma_eval_stats_t st; /* prefilter effectiveness counters */
+    uint64_t re_unknown; /* |re evaluations that ended on a PCRE2 error */
     int prefilter_on; /* 1 = use Teddy prefilter (default) */
 };
 
@@ -123,7 +125,14 @@ void sigma_eval_get_stats(const sigma_eval_t* e, sigma_eval_stats_t* out) {
 }
 
 void sigma_eval_reset_stats(sigma_eval_t* e) {
-    if (e) memset(&e->st, 0, sizeof(e->st));
+    if (e) {
+        memset(&e->st, 0, sizeof(e->st));
+        e->re_unknown = 0;
+    }
+}
+
+uint64_t sigma_eval_re_unknown(const sigma_eval_t* e) {
+    return e ? e->re_unknown : 0;
 }
 
 void sigma_eval_set_prefilter(sigma_eval_t* e, int enabled) {
@@ -269,7 +278,27 @@ static const char* resolve_field(sigma_eval_t* e, sigma_field_fn fn, void* ctx, 
     return e->vptr[field_id];
 }
 
-static bool pred_match(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigma_pred_t* p, uint32_t pred_idx) {
+/* Three-valued (Kleene) logic. A predicate is unknown when the engine could
+ * not decide it (a |re that hit a PCRE2 limit). NOT keeps unknown, AND is
+ * false on any false, OR is true on any true. */
+#define TV_FALSE 0
+#define TV_TRUE 1
+#define TV_UNKNOWN 2
+typedef uint8_t tv_t;
+
+static inline tv_t tv_not(tv_t a) {
+    return a == TV_UNKNOWN ? TV_UNKNOWN : (tv_t)!a;
+}
+static inline tv_t tv_and(tv_t a, tv_t b) {
+    if (a == TV_FALSE || b == TV_FALSE) return TV_FALSE;
+    return (a == TV_UNKNOWN || b == TV_UNKNOWN) ? TV_UNKNOWN : TV_TRUE;
+}
+static inline tv_t tv_or(tv_t a, tv_t b) {
+    if (a == TV_TRUE || b == TV_TRUE) return TV_TRUE;
+    return (a == TV_UNKNOWN || b == TV_UNKNOWN) ? TV_UNKNOWN : TV_FALSE;
+}
+
+static tv_t pred_match(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigma_pred_t* p, uint32_t pred_idx) {
     size_t vlen = 0;
     const char* val = resolve_field(e, fn, ctx, p->field_id, &vlen);
     bool res = false;
@@ -306,14 +335,21 @@ static bool pred_match(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigm
             /* Per-worker match_data, created on first RE use and reused. */
             if (!e->md) {
                 e->md = pcre2_match_data_create(1, NULL);
-                if (!e->md) break;
+                if (!e->md) {
+                    e->re_unknown++;
+                    return TV_UNKNOWN;
+                }
             }
             pthread_once(&g_re_mctx_once, sigma_re_mctx_init);
             /* PCRE2 matches a length-delimited subject, no NUL copy needed.
-             * g_re_mctx bounds match/depth (see its definition above); a
-             * limit hit returns negative, already handled by >= 0 below
-             * exactly like PCRE2_ERROR_NOMATCH -- no separate branch. */
-            res = (pcre2_match(arr[pred_idx].re, (PCRE2_SPTR)val, vlen, 0, 0, e->md, g_re_mctx) >= 0);
+             * Any error other than "no match" (match, depth, heap or JIT
+             * stack limit) leaves the predicate undecided, negated or not. */
+            int rc = pcre2_match(arr[pred_idx].re, (PCRE2_SPTR)val, vlen, 0, 0, e->md, g_re_mctx);
+            if (rc < 0 && rc != PCRE2_ERROR_NOMATCH) {
+                e->re_unknown++;
+                return TV_UNKNOWN;
+            }
+            res = rc >= 0;
             break;
         }
         default: {
@@ -362,31 +398,33 @@ static bool pred_match(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigm
 
 done:
     if (p->flags & SIGMA_PF_NEGATE) res = !res;
-    return res;
+    return res ? TV_TRUE : TV_FALSE;
 }
 
 /* Selection = AND across groups, OR within a group (Sigma map semantics).
  * Predicates are contiguous and grouped by the builder. */
-static bool sel_match(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigma_sel_t* sel) {
-    if (sel->pred_count == 0) return false;
+static tv_t sel_match(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigma_sel_t* sel) {
+    if (sel->pred_count == 0) return TV_FALSE;
     const sigma_db_t* db = e->db;
     const sigma_pred_t* preds = db->preds + sel->pred_start;
     const uint32_t n = sel->pred_count;
 
-    bool group_or = false;
+    tv_t all = TV_TRUE; /* AND of the completed groups */
+    tv_t group_or = TV_FALSE;
     uint16_t cur_group = preds[0].group_id;
 
     for (uint32_t i = 0; i < n; i++) {
         if (preds[i].group_id != cur_group) {
-            if (!group_or) /* a completed group failed -> selection fails */
-                return false;
-            group_or = false;
+            all = tv_and(all, group_or);
+            if (all == TV_FALSE) /* a completed group failed -> selection fails */
+                return TV_FALSE;
+            group_or = TV_FALSE;
             cur_group = preds[i].group_id;
         }
-        if (!group_or) /* short-circuit: skip rest of an already-true group */
-            group_or = pred_match(e, fn, ctx, &preds[i], sel->pred_start + i);
+        if (group_or != TV_TRUE) /* short-circuit: skip rest of an already-true group */
+            group_or = tv_or(group_or, pred_match(e, fn, ctx, &preds[i], sel->pred_start + i));
     }
-    return group_or; /* AND with the final group */
+    return tv_and(all, group_or); /* AND with the final group */
 }
 
 /* RPN cell: a bool, a not-yet-run selection, or a deferred NOT of a selection.
@@ -402,29 +440,31 @@ typedef struct {
     uint32_t sel_idx;
 } rpn_cell_t;
 
-static bool rpn_force(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigma_rule_t* r, rpn_cell_t* c) {
-    if (c->kind == RPN_BOOL) return c->val != 0;
+static tv_t rpn_force(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigma_rule_t* r, rpn_cell_t* c) {
+    if (c->kind == RPN_BOOL) return c->val;
     if (c->sel_idx >= r->sel_count) {
         c->kind = RPN_BOOL;
-        c->val = 0;
-        return false;
+        c->val = TV_FALSE;
+        return TV_FALSE;
     }
-    bool hit = sel_match(e, fn, ctx, &e->db->sels[r->sel_start + c->sel_idx]);
-    if (c->kind == RPN_NOTSEL) hit = !hit;
+    tv_t hit = sel_match(e, fn, ctx, &e->db->sels[r->sel_start + c->sel_idx]);
+    if (c->kind == RPN_NOTSEL) hit = tv_not(hit);
     c->kind = RPN_BOOL;
-    c->val = hit ? 1 : 0;
+    c->val = hit;
     return hit;
 }
 
 /* Evaluate a rule's condition.  cond_count==0 => AND of all the rule's
- * selections.  Otherwise run the compiled RPN over local selection results. */
+ * selections.  Otherwise run the compiled RPN over local selection results.
+ * An unknown condition fires: an input that makes a |re undecidable must not
+ * hide the event, whichever side of a NOT the pattern sits on. */
 static bool rule_match(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigma_rule_t* r) {
     const sigma_db_t* db = e->db;
 
     /* Implicit AND-of-all when there is no explicit condition. */
     if (r->cond_count == 0) {
         for (uint32_t i = 0; i < r->sel_count; i++)
-            if (!sel_match(e, fn, ctx, &db->sels[r->sel_start + i])) return false;
+            if (sel_match(e, fn, ctx, &db->sels[r->sel_start + i]) == TV_FALSE) return false;
         return r->sel_count > 0;
     }
 
@@ -439,7 +479,7 @@ static bool rule_match(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigm
                 uint32_t li = tok[i].sel_idx;
                 if (li >= r->sel_count) return false;
                 stack[sp].kind = RPN_SEL;
-                stack[sp].val = 0;
+                stack[sp].val = TV_FALSE;
                 stack[sp].sel_idx = li;
                 sp++;
                 break;
@@ -451,24 +491,24 @@ static bool rule_match(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigm
                 else if (stack[sp - 1].kind == RPN_NOTSEL)
                     stack[sp - 1].kind = RPN_SEL;
                 else
-                    stack[sp - 1].val = (uint8_t)!stack[sp - 1].val;
+                    stack[sp - 1].val = tv_not(stack[sp - 1].val);
                 break;
             case SIGMA_C_AND: {
                 if (sp < 2) return false;
                 rpn_cell_t b = stack[--sp];
                 rpn_cell_t* a = &stack[sp - 1];
-                bool av = rpn_force(e, fn, ctx, r, a);
+                tv_t av = rpn_force(e, fn, ctx, r, a);
                 a->kind = RPN_BOOL;
-                a->val = (av && rpn_force(e, fn, ctx, r, &b)) ? 1 : 0;
+                a->val = av == TV_FALSE ? TV_FALSE : tv_and(av, rpn_force(e, fn, ctx, r, &b));
                 break;
             }
             case SIGMA_C_OR: {
                 if (sp < 2) return false;
                 rpn_cell_t b = stack[--sp];
                 rpn_cell_t* a = &stack[sp - 1];
-                bool av = rpn_force(e, fn, ctx, r, a);
+                tv_t av = rpn_force(e, fn, ctx, r, a);
                 a->kind = RPN_BOOL;
-                a->val = (av || rpn_force(e, fn, ctx, r, &b)) ? 1 : 0;
+                a->val = av == TV_TRUE ? TV_TRUE : tv_or(av, rpn_force(e, fn, ctx, r, &b));
                 break;
             }
             default:
@@ -476,7 +516,7 @@ static bool rule_match(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigm
         }
     }
     if (sp != 1) return false;
-    return rpn_force(e, fn, ctx, r, &stack[0]);
+    return rpn_force(e, fn, ctx, r, &stack[0]) != TV_FALSE;
 }
 
 sigma_eval_t* sigma_eval_create(const sigma_db_t* db) {

@@ -1724,7 +1724,10 @@ static void test_re_match_limit_bounded(void) {
         bool fired = fires(ev, &e, 4001, NULL);
         double secs = (double)(clock() - t0) / CLOCKS_PER_SEC;
 
-        CHECK(!fired, "re-limit: ^(a+)+$ vs adversarial non-match must not fire");
+        /* The limit stops PCRE2 before it decides, so the rule fires and the
+         * undecided evaluation is counted. */
+        CHECK(fired, "re-limit: ^(a+)+$ undecided by the limit fires");
+        CHECK(sigma_eval_re_unknown(ev) == 1, "re-limit: undecided evaluation counted");
         /* Generous: the bounded path measured well under 0.01s in
          * development; 2s leaves ample headroom for a slow/loaded CI
          * runner while still failing hard if the match_context is ever
@@ -1780,6 +1783,97 @@ static void test_re_match_limit_bounded(void) {
         sigma_db_free(&db);
         free(t);
     }
+}
+
+/* A |re the limit cannot decide must not hide a rule, on either side of a
+ * NOT, and a decided filter still suppresses. */
+static void test_re_limit_fails_closed(void) {
+    tb_t* t = calloc(1, sizeof(*t));
+    assert(t);
+    {
+        uint32_t ps = t->db.n_preds;
+        tb_pred_str(t, "process.command_line", SIGMA_OP_RE, "(\\w+\\s?)+:evil", 0, 0);
+        tb_rule(t, 4101, tb_sel(t, ps), 1, 0, 0, SIGMA_VERDICT_ALERT, 3, 30);
+    }
+    {
+        /* sel and not filter, the filter a |re */
+        uint32_t ps = t->db.n_preds;
+        tb_pred_str(t, "user.name", SIGMA_OP_EQ, "root", 0, 0);
+        uint32_t s0 = tb_sel(t, ps);
+        ps = t->db.n_preds;
+        tb_pred_str(t, "process.command_line", SIGMA_OP_RE, "^(a+)+$", 0, 0);
+        tb_sel(t, ps);
+        uint32_t c0 = t->db.n_cond;
+        t->cond[t->db.n_cond++] = (sigma_ctok_t){.kind = SIGMA_C_SEL, .sel_idx = 0};
+        t->cond[t->db.n_cond++] = (sigma_ctok_t){.kind = SIGMA_C_SEL, .sel_idx = 1};
+        t->cond[t->db.n_cond++] = (sigma_ctok_t){.kind = SIGMA_C_NOT};
+        t->cond[t->db.n_cond++] = (sigma_ctok_t){.kind = SIGMA_C_AND};
+        tb_rule(t, 4102, s0, 2, c0, 4, SIGMA_VERDICT_ALERT, 3, 30);
+    }
+    {
+        /* undecided |re and not a decided filter */
+        uint32_t ps = t->db.n_preds;
+        tb_pred_str(t, "process.command_line", SIGMA_OP_RE, "^(a+)+$", 0, 0);
+        uint32_t s0 = tb_sel(t, ps);
+        ps = t->db.n_preds;
+        tb_pred_str(t, "user.name", SIGMA_OP_EQ, "svc", 0, 0);
+        tb_sel(t, ps);
+        uint32_t c0 = t->db.n_cond;
+        t->cond[t->db.n_cond++] = (sigma_ctok_t){.kind = SIGMA_C_SEL, .sel_idx = 0};
+        t->cond[t->db.n_cond++] = (sigma_ctok_t){.kind = SIGMA_C_SEL, .sel_idx = 1};
+        t->cond[t->db.n_cond++] = (sigma_ctok_t){.kind = SIGMA_C_NOT};
+        t->cond[t->db.n_cond++] = (sigma_ctok_t){.kind = SIGMA_C_AND};
+        tb_rule(t, 4103, s0, 2, c0, 4, SIGMA_VERDICT_ALERT, 3, 30);
+    }
+    sigma_db_t db = tb_finish(t);
+    CHECK(sigma_db_finalize(&db) == 0, "re-closed: finalize ok");
+    sigma_eval_t* ev = sigma_eval_create(&db);
+    assert(ev);
+
+    char padded[64];
+    memset(padded, 'a', 40);
+    strcpy(padded + 40, "! x:evil");
+    {
+        kv_t kv[] = {{"process.command_line", "x:evil"}};
+        event_t e = {kv, 1};
+        CHECK(fires(ev, &e, 4101, NULL), "re-closed: x:evil fires");
+    }
+    {
+        kv_t kv[] = {{"process.command_line", padded}};
+        event_t e = {kv, 1};
+        CHECK(fires(ev, &e, 4101, NULL), "re-closed: 40 a + '! x:evil' still fires");
+    }
+    char adversarial[42];
+    memset(adversarial, 'a', 40);
+    adversarial[40] = 'X';
+    adversarial[41] = '\0';
+    {
+        kv_t kv[] = {{"user.name", "root"}, {"process.command_line", adversarial}};
+        event_t e = {kv, 2};
+        CHECK(fires(ev, &e, 4102, NULL), "re-closed: undecided filter does not suppress");
+    }
+    {
+        kv_t kv[] = {{"user.name", "root"}, {"process.command_line", "bbb"}};
+        event_t e = {kv, 2};
+        CHECK(fires(ev, &e, 4102, NULL), "re-closed: decided non-matching filter, fires");
+    }
+    {
+        kv_t kv[] = {{"user.name", "root"}, {"process.command_line", "aaa"}};
+        event_t e = {kv, 2};
+        CHECK(!fires(ev, &e, 4102, NULL), "re-closed: decided matching filter suppresses");
+    }
+    {
+        kv_t kv[] = {{"user.name", "svc"}, {"process.command_line", adversarial}};
+        event_t e = {kv, 2};
+        CHECK(!fires(ev, &e, 4103, NULL), "re-closed: undecided sel and a decided filter, no fire");
+    }
+    CHECK(sigma_eval_re_unknown(ev) >= 3, "re-closed: undecided evaluations counted");
+    sigma_eval_reset_stats(ev);
+    CHECK(sigma_eval_re_unknown(ev) == 0, "re-closed: reset clears the count");
+
+    sigma_eval_free(ev);
+    sigma_db_free(&db);
+    free(t);
 }
 
 /* The loader accepts SIGMA_FORMAT_VERSION_MIN through SIGMA_FORMAT_VERSION: a
@@ -2065,6 +2159,7 @@ int main(void) {
     test_prefilter_cnf();
     test_prefilter_fwit();
     test_re_match_limit_bounded();
+    test_re_limit_fails_closed();
 
     printf("\nlibsigma matcher+format: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
