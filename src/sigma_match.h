@@ -313,6 +313,12 @@ void sigma_eval_get_stats(const sigma_eval_t* e, sigma_eval_stats_t* out);
  * pass does not pollute the effectiveness ratio. */
 void sigma_eval_reset_stats(sigma_eval_t* e);
 
+/* |re evaluations on this scratch that ended on a PCRE2 error other than "no
+ * match" (match, depth, heap or JIT stack limit). Such a predicate is
+ * undecided, and a rule whose condition is undecided fires. Reset by
+ * sigma_eval_reset_stats. NULL-safe. */
+uint64_t sigma_eval_re_unknown(const sigma_eval_t* e);
+
 /* Create/destroy per-thread scratch bound to a db (sized to db->n_fields). */
 sigma_eval_t* sigma_eval_create(const sigma_db_t* db);
 void sigma_eval_free(sigma_eval_t* e);

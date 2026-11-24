@@ -18,6 +18,8 @@ are unchanged.
 - `corr_engine_set_clock` sets a receive clock and the event-time skew the
   engine accepts around it. `corr_engine_clock_stats` returns how many event
   times were non-finite, ahead, or behind.
+- `sigma_eval_re_unknown` returns how many `|re` evaluations on a scratch
+  ended on a PCRE2 limit.
 
 ### Fixed
 
@@ -50,6 +52,12 @@ are unchanged.
   It now requires a finite `ts`, a `group` of strings no longer than the
   caller's slots, a `count` from 1 to 4096, a finite SUM `numeric`, a
   non-zero SEEN mask, and a DISTINCT `value`. Anything else is `-1`.
+- A `|re` that hit the PCRE2 match, depth, heap or JIT stack limit was
+  read as "no match", so padding a field hid a real match. Such a predicate
+  is now undecided, and a rule whose condition is undecided fires, on either
+  side of a NOT. A filter that matches still suppresses. An adversarial
+  non-match on a backtracking pattern now fires instead of staying silent.
+  The heap limit is now 16 MiB per match.
 
 ## [4.1.1] - 2026-11-16
 
