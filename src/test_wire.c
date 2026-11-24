@@ -46,6 +46,63 @@ int main(void) {
     check(j != NULL && corr_contrib_from_json(j, &c, slots, CORR_MAX_GROUP_FIELDS) != 0, "contrib v=2 rejected");
     if (j) json_object_put(j);
 
+    /* Value ranges: each field is typed and bounded on decode. */
+    {
+        static const struct {
+            const char* json;
+            int ok;
+            const char* what;
+        } cases[] = {
+            {"{\"v\":1,\"kind\":\"count\",\"corr_id\":\"ec\",\"ts\":1,\"group\":[\"a\"],\"count\":4096}", 1,
+             "count 4096"},
+            {"{\"v\":1,\"kind\":\"count\",\"corr_id\":\"ec\",\"ts\":1,\"group\":[\"a\"]}", 1, "count absent"},
+            {"{\"v\":1,\"kind\":\"count\",\"corr_id\":\"ec\",\"ts\":1,\"group\":[\"a\"],\"count\":-1}", 0, "count -1"},
+            {"{\"v\":1,\"kind\":\"count\",\"corr_id\":\"ec\",\"ts\":1,\"group\":[\"a\"],\"count\":0}", 0, "count 0"},
+            {"{\"v\":1,\"kind\":\"count\",\"corr_id\":\"ec\",\"ts\":1,\"group\":[\"a\"],\"count\":4097}", 0,
+             "count 4097"},
+            {"{\"v\":1,\"kind\":\"count\",\"corr_id\":\"ec\",\"ts\":1,\"group\":[\"a\"],\"count\":\"5\"}", 0,
+             "count string"},
+            {"{\"v\":1,\"kind\":\"count\",\"corr_id\":\"ec\",\"ts\":1,\"group\":[\"a\"],\"count\":2.5}", 0,
+             "count double"},
+            {"{\"v\":1,\"kind\":\"count\",\"corr_id\":\"ec\",\"group\":[\"a\"]}", 0, "ts absent"},
+            {"{\"v\":1,\"kind\":\"count\",\"corr_id\":\"ec\",\"ts\":\"1\",\"group\":[\"a\"]}", 0, "ts string"},
+            {"{\"v\":1,\"kind\":\"count\",\"corr_id\":\"ec\",\"ts\":Infinity,\"group\":[\"a\"]}", 0, "ts Infinity"},
+            {"{\"v\":1,\"kind\":\"count\",\"corr_id\":\"ec\",\"ts\":NaN,\"group\":[\"a\"]}", 0, "ts NaN"},
+            {"{\"v\":1,\"kind\":\"count\",\"corr_id\":\"ec\",\"ts\":1}", 0, "group absent"},
+            {"{\"v\":1,\"kind\":\"count\",\"corr_id\":\"ec\",\"ts\":1,\"group\":[1]}", 0, "group number element"},
+            {"{\"v\":1,\"kind\":\"count\",\"corr_id\":\"ec\",\"ts\":1,\"group\":[null]}", 0, "group null element"},
+            {"{\"v\":1,\"kind\":\"count\",\"corr_id\":\"ec\",\"ts\":1,"
+             "\"group\":[\"1\",\"2\",\"3\",\"4\",\"5\",\"6\",\"7\",\"8\",\"9\"]}",
+             0, "group past the cap"},
+            {"{\"v\":1,\"kind\":\"sum\",\"corr_id\":\"vs\",\"ts\":1,\"group\":[\"a\"],\"numeric\":-12.5}", 1,
+             "sum numeric"},
+            {"{\"v\":1,\"kind\":\"sum\",\"corr_id\":\"vs\",\"ts\":1,\"group\":[\"a\"],\"numeric\":7}", 1,
+             "sum integer"},
+            {"{\"v\":1,\"kind\":\"sum\",\"corr_id\":\"vs\",\"ts\":1,\"group\":[\"a\"]}", 0, "sum numeric absent"},
+            {"{\"v\":1,\"kind\":\"sum\",\"corr_id\":\"vs\",\"ts\":1,\"group\":[\"a\"],\"numeric\":Infinity}", 0,
+             "sum numeric Infinity"},
+            {"{\"v\":1,\"kind\":\"sum\",\"corr_id\":\"vs\",\"ts\":1,\"group\":[\"a\"],\"numeric\":\"1e999\"}", 0,
+             "sum numeric string"},
+            {"{\"v\":1,\"kind\":\"seen\",\"corr_id\":\"tp\",\"ts\":1,\"group\":[\"a\"],\"seen_mask\":-1}", 1,
+             "seen all 64 bits"},
+            {"{\"v\":1,\"kind\":\"seen\",\"corr_id\":\"tp\",\"ts\":1,\"group\":[\"a\"],\"seen_mask\":0}", 0, "seen 0"},
+            {"{\"v\":1,\"kind\":\"seen\",\"corr_id\":\"tp\",\"ts\":1,\"group\":[\"a\"]}", 0, "seen absent"},
+            {"{\"v\":1,\"kind\":\"distinct\",\"corr_id\":\"vc\",\"ts\":1,\"group\":[\"a\"],\"value\":\"u\"}", 1,
+             "distinct value"},
+            {"{\"v\":1,\"kind\":\"distinct\",\"corr_id\":\"vc\",\"ts\":1,\"group\":[\"a\"]}", 0, "distinct absent"},
+            {"{\"v\":1,\"kind\":\"distinct\",\"corr_id\":\"vc\",\"ts\":1,\"group\":[\"a\"],\"value\":3}", 0,
+             "distinct number"},
+        };
+        for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
+            char msg[96];
+            j = json_tokener_parse(cases[k].json);
+            int rc = j ? corr_contrib_from_json(j, &c, slots, CORR_MAX_GROUP_FIELDS) : -2;
+            snprintf(msg, sizeof(msg), "contrib %s %s", cases[k].what, cases[k].ok ? "accepted" : "rejected");
+            check(j != NULL && (rc == 0) == cases[k].ok, msg);
+            if (j) json_object_put(j);
+        }
+    }
+
     /* "key" is the corr_owner_key a hash transport routes on: the exact bytes
      * corr_owner_index hashes, whole at any length, and ignored on parse. */
     {

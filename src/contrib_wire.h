@@ -24,7 +24,11 @@ json_object* corr_contrib_to_json(const corr_contrib_t* c, const char* origin);
 
 /* Parse. group strings alias the json object (valid until json_object_put).
  * group_slots holds the pointer array corr_contrib_t.group_vals uses.
- * Returns 0 on success, -1 on malformed. */
+ * Returns 0 on success, -1 on malformed: a missing or non-finite ts, a
+ * missing group, a group longer than group_slots_cap or with a non-string
+ * element, a count outside 1..4096, a missing or non-finite SUM numeric, a
+ * zero SEEN mask, or a missing DISTINCT value. Validation is not
+ * authentication: the transport has to establish who sent it. */
 int corr_contrib_from_json(json_object* j, corr_contrib_t* out, const char** group_slots, size_t group_slots_cap);
 
 #ifdef __cplusplus
