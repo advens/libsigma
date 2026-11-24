@@ -19,6 +19,12 @@ are unchanged.
   engine accepts around it. `corr_engine_clock_stats` returns how many event
   times were non-finite, ahead, or behind.
 
+### Fixed
+
+- `temporal_ordered` kept one partial sequence per group and ignored a new
+  first step until the old one left the window, so an early first step hid
+  a later complete sequence. Each step now keeps its latest in-window run.
+
 ### Security
 
 - The `.sigmac` loader now rejects a CIDR with an unknown family or a prefix
