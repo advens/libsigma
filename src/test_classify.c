@@ -1366,6 +1366,65 @@ static void test_contrib_ages(void) {
     }
 }
 
+/* A full group map evicts by progress. A group with recent hits outlives a
+ * flood of one-hit groups and still fires; when every group has progress the
+ * least recently used of the lowest tier goes and is counted; hits decay by
+ * half per window so an old burst does not pin a group's tier. */
+static void test_evict_by_progress(void) {
+    corr_rule_t r = mk_event_count(); /* >= 10 in 300 s */
+    corr_caps_t caps = corr_caps_default();
+    caps.max_groups = 4;
+    corr_engine_t* e = corr_engine_new(&r, 1, caps);
+    corr_stats_t st;
+    int fired = 0;
+    for (int i = 0; i < 8; i++) fired += feed(e, "203.0.113.9", "root", BASE_1, 1, 100.0 + i, NULL);
+    for (int i = 0; i < 5000; i++) {
+        char ip[32];
+        snprintf(ip, sizeof(ip), "10.%d.%d.1", i >> 8, i & 255);
+        feed(e, ip, "flood", BASE_1, 1, 110.0, NULL);
+    }
+    CHECK(corr_engine_groups_for(e, "brute") == 4, "evict: map stays at max_groups under a flood");
+    for (int i = 0; i < 2; i++) fired += feed(e, "203.0.113.9", "root", BASE_1, 1, 120.0 + i, NULL);
+    CHECK(fired == 1, "evict: the group with progress survives 5000 new groups and fires");
+    corr_engine_stats(e, &st);
+    CHECK(st.groups_evicted >= 4990, "evict: the flood evicts its own groups");
+    CHECK(corr_engine_groups_evicted_progress(e) == 0, "evict: no group with progress was evicted");
+    corr_engine_free(e);
+
+    /* Every group at two hits: the next new group evicts one, and it counts. */
+    e = corr_engine_new(&r, 1, caps);
+    for (int k = 0; k < 4; k++) {
+        char ip[32];
+        snprintf(ip, sizeof(ip), "10.9.0.%d", k);
+        feed(e, ip, "u", BASE_1, 1, 100.0, NULL);
+        feed(e, ip, "u", BASE_1, 1, 101.0, NULL);
+    }
+    feed(e, "10.9.1.1", "u", BASE_1, 1, 102.0, NULL);
+    CHECK(corr_engine_groups_for(e, "brute") == 4, "evict: all with progress, still capped");
+    CHECK(corr_engine_groups_evicted_progress(e) == 1, "evict: evicting a group with progress is counted");
+    corr_engine_free(e);
+
+    /* Decay: a burst of 64 hits, then one hit every 250 s (it stays alive) for
+     * 3000 s, halves to 3 recent hits (tier 1). Three groups at 4 hits (tier 2)
+     * then outrank it, so the next new group evicts it: 8 more hits after that
+     * build a new group of 8 and do not fire. Without decay it would stay at
+     * tier 6, keep its 2 in-window hits and fire at the 8th. */
+    e = corr_engine_new(&r, 1, caps);
+    for (int i = 0; i < 64; i++) feed(e, "10.8.0.1", "old", BASE_1, 1, 100.0, NULL);
+    for (double t = 350.0; t <= 3100.0; t += 250.0) feed(e, "10.8.0.1", "old", BASE_1, 1, t, NULL);
+    for (int k = 0; k < 3; k++) {
+        char ip[32];
+        snprintf(ip, sizeof(ip), "10.8.1.%d", k);
+        for (int i = 0; i < 4; i++) feed(e, ip, "new", BASE_1, 1, 3101.0, NULL);
+    }
+    feed(e, "10.8.2.1", "next", BASE_1, 1, 3102.0, NULL);
+    CHECK(corr_engine_groups_evicted_progress(e) == 1, "evict: the decayed group is evicted at its tier");
+    fired = 0;
+    for (int i = 0; i < 8; i++) fired += feed(e, "10.8.0.1", "old", BASE_1, 1, 3103.0, NULL);
+    CHECK(fired == 0, "evict: an old burst does not pin a group's tier");
+    corr_engine_free(e);
+}
+
 /* The ring starts small and doubles. Growth must keep every live entry in
  * order, also when the head has wrapped, for the time ring and the value ring
  * that moves with it. At the cap the oldest entry is overwritten. */
@@ -1443,6 +1502,7 @@ int main(void) {
     test_beaconing_bucketed();
     test_group_by_aliases();
     test_ring_growth();
+    test_evict_by_progress();
     test_receive_clock();
 
     printf("\nlibsigma correlation engine: %d passed, %d failed\n", g_pass, g_fail);
