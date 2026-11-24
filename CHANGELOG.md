@@ -10,6 +10,15 @@ is called out explicitly.
 
 ## [Unreleased]
 
+MINOR: additive C ABI. The SONAME, the `.sigmac` format, and the contrib wire
+are unchanged.
+
+### Added
+
+- `corr_engine_set_clock` sets a receive clock and the event-time skew the
+  engine accepts around it. `corr_engine_clock_stats` returns how many event
+  times were non-finite, ahead, or behind.
+
 ### Security
 
 - The `.sigmac` loader now rejects a CIDR with an unknown family or a prefix
@@ -20,6 +29,11 @@ is called out explicitly.
   engine, while each correlation only holds its own lock. Two workers on two
   such correlations wrote the same buffer and could fire on the other's
   values. Each percentile or median correlation now owns its buffer.
+- Event time comes from the sender, and it also drove the expiry sweep. One
+  event dated in the future dropped every group of every correlation and
+  stopped the sweep until the clock reached that date. With a clock set, the
+  sweep runs on it and event time is clamped to the accepted skew. Without
+  one, a non-finite event time is now refused.
 
 ## [4.1.1] - 2026-11-16
 
