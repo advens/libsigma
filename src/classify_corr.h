@@ -278,6 +278,26 @@ typedef struct {
 /* Snapshot the engine's boundary counters into *out (both must be non-NULL). */
 void corr_engine_stats(const corr_engine_t* e, corr_stats_t* out);
 
+/* Receive clock, in seconds on the same scale as event times. */
+typedef double (*corr_clock_fn)(void* ctx);
+
+/* Bound event time by a clock the sender does not control. With a clock set,
+ * corr_on_event and corr_on_contribution read it once per call: an event time
+ * more than max_ahead_s after it, or more than max_behind_s before it, is
+ * clamped to that bound, a non-finite one is replaced by the clock, and the
+ * expiry sweep runs on the clock instead of on event times. Without a clock
+ * (the default, for replay of trusted input) event time drives everything and
+ * a non-finite one is refused. now_fn NULL removes the clock.
+ *
+ * Call before the engine is shared between threads. now_fn must be safe to
+ * call from every worker. Returns 0, or -1 on a NULL engine or a negative or
+ * non-finite bound. */
+int corr_engine_set_clock(corr_engine_t* e, corr_clock_fn now_fn, void* ctx, double max_ahead_s, double max_behind_s);
+
+/* Event times refused or replaced for being non-finite, and clamped for being
+ * ahead of or behind the clock. Any pointer may be NULL. */
+void corr_engine_clock_stats(const corr_engine_t* e, uint64_t* nonfinite, uint64_t* ahead, uint64_t* behind);
+
 /* ----------------------------------------------------------------------------
  * A fired correlation (the activation the caller serialises).  All string
  * pointers reference the corr_rule_t the caller owns (valid for its lifetime);
@@ -332,8 +352,8 @@ typedef const char* (*corr_field_fn)(void* ctx, const char* name);
 
 /* Evaluate the event against every interested correlation; append fired
  * activations to out[] (up to max_out).  Returns the number fired (may exceed
- * max_out, out is capped, the count is not).  ts is a monotonic event time in
- * seconds (the caller's clock; the engine only does arithmetic on it).
+ * max_out, out is capped, the count is not).  ts is the event time in seconds,
+ * bounded by the receive clock when one is set (corr_engine_set_clock).
  *
  * grp_scratch / grp_scratch_cap: CALLER-OWNED, per-worker scratch (an array of
  * max_out * CORR_MAX_GROUP_FIELDS `const char*` slots is ample).  The
