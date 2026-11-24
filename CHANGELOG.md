@@ -34,6 +34,11 @@ are unchanged.
   stopped the sweep until the clock reached that date. With a clock set, the
   sweep runs on it and event time is clamped to the accepted skew. Without
   one, a non-finite event time is now refused.
+- Remote COUNT, SUM and SEEN partials were added to per-group totals that
+  never aged, so one partial counted in every later window of that group.
+  Partials now go into the group's event ring and seen set at their event
+  time and expire with the window. A partial whose kind does not match the
+  correlation type is refused.
 
 ## [4.1.1] - 2026-11-16
 

@@ -1247,6 +1247,85 @@ static void test_receive_clock(void) {
     corr_engine_free(e);
 }
 
+/* Remote partials age with the window like local events. */
+static int contrib(corr_engine_t* e,
+                   corr_contrib_kind_t kind,
+                   const char* id,
+                   const char* const* gv,
+                   size_t ng,
+                   double ts,
+                   uint32_t count,
+                   double numeric,
+                   uint64_t seen) {
+    corr_contrib_t c;
+    memset(&c, 0, sizeof(c));
+    c.kind = kind;
+    c.corr_id = id;
+    c.group_vals = gv;
+    c.n_group = ng;
+    c.ts = ts;
+    c.count = count;
+    c.numeric = numeric;
+    c.seen_mask = seen;
+    corr_fire_t fires[4];
+    static const char* scratch[8 * CORR_MAX_GROUP_FIELDS];
+    return corr_on_contribution(e, &c, NULL, NULL, fires, 4, scratch, 32);
+}
+
+static void test_contrib_ages(void) {
+    /* COUNT: one partial of 3 at t=0, then a local event every 30 s from
+     * t=45 (two per window at most). No window ever holds five. */
+    {
+        corr_rule_t r = mk_event_count();
+        r.cond_count = 5;
+        r.timespan_s = 60;
+        corr_engine_t* e = corr_engine_new(&r, 1, corr_caps_default());
+        const char* gv[] = {"203.0.113.9", "root"};
+        contrib(e, CORR_CONTRIB_COUNT, "brute", gv, 2, 0.0, 3, 0, 0);
+        int fired = 0;
+        for (int i = 0; i < 360; i++) fired += feed(e, "203.0.113.9", "root", BASE_1, 1, 45.0 + 30.0 * i, NULL);
+        CHECK(fired == 0, "contrib ages: COUNT partial leaves the window");
+        corr_engine_free(e);
+    }
+    /* SUM: a partial of 1000 bytes fires, then expires. The local event at
+     * t=30 keeps the group alive through the sweep. */
+    {
+        corr_rule_t r = mk_value_sum();
+        r.timespan_s = 60;
+        corr_engine_t* e = corr_engine_new(&r, 1, corr_caps_default());
+        const char* gv[] = {"203.0.113.9"};
+        CHECK(contrib(e, CORR_CONTRIB_SUM, "exfil", gv, 1, 0.0, 0, 1000.0, 0) == 1, "contrib ages: SUM partial fires");
+        feed_num(e, "203.0.113.9", "destination.bytes", "0", 30.0, NULL);
+        CHECK(feed_num(e, "203.0.113.9", "destination.bytes", "1", 61.0, NULL) == 0,
+              "contrib ages: SUM partial leaves the window");
+        corr_engine_free(e);
+    }
+    /* SEEN: rid 1 from a peer at t=0, rid 2 at t=30, rid 3 at t=61. */
+    {
+        corr_rule_t r = mk_temporal();
+        r.timespan_s = 60;
+        corr_engine_t* e = corr_engine_new(&r, 1, corr_caps_default());
+        const char* gv[] = {"203.0.113.9"};
+        contrib(e, CORR_CONTRIB_SEEN, "cluster", gv, 1, 0.0, 0, 0, 1u);
+        static const uint32_t R2[] = {2}, R3[] = {3};
+        feed(e, "203.0.113.9", NULL, R2, 1, 30.0, NULL);
+        CHECK(feed(e, "203.0.113.9", NULL, R3, 1, 61.0, NULL) == 0, "contrib ages: SEEN partial leaves the window");
+        CHECK(contrib(e, CORR_CONTRIB_SEEN, "cluster", gv, 1, 70.0, 0, 0, 1u) == 1,
+              "contrib ages: SEEN partial in the window completes the set");
+        corr_engine_free(e);
+    }
+    /* A partial for another type is refused and creates no group. */
+    {
+        corr_rule_t r = mk_value_sum();
+        corr_engine_t* e = corr_engine_new(&r, 1, corr_caps_default());
+        const char* gv[] = {"203.0.113.9"};
+        CHECK(contrib(e, CORR_CONTRIB_COUNT, "exfil", gv, 1, 0.0, 5000, 0, 0) == 0,
+              "contrib: COUNT to value_sum refused");
+        CHECK(corr_engine_groups_for(e, "exfil") == 0, "contrib: refused partial created no group");
+        corr_engine_free(e);
+    }
+}
+
 int main(void) {
     test_event_count();
     test_value_count();
@@ -1255,6 +1334,7 @@ int main(void) {
     test_value_percentile();
     test_value_median();
     test_contrib_merge_count();
+    test_contrib_ages();
     test_apply_skip_and_owner();
     test_watermark_reorder();
     test_temporal_condition();
