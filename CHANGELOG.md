@@ -10,7 +10,14 @@ is called out explicitly.
 
 ## [Unreleased]
 
-PATCH: no change to the C ABI, the `.sigmac` format, or the contrib wire.
+MINOR: additive C ABI. The SONAME, the `.sigmac` format, and the contrib wire
+are unchanged.
+
+### Added
+
+- `corr_engine_set_memory` bounds the bytes of group state across all
+  correlations. `corr_engine_memory_stats` returns the bytes in use and how
+  many groups were evicted to keep the budget.
 
 ### Security
 
@@ -20,6 +27,13 @@ PATCH: no change to the C ABI, the `.sigmac` format, or the contrib wire.
   correlation. A stored value now keeps its first 256 bytes, its length and
   a keyed hash of all of it, and the same events take 2.1 MiB. Values that
   share their first 256 bytes stay distinct.
+- The group caps are per correlation, so the engine's memory grew with the
+  number of rules: 300000 new keys on 100 event_count correlations took
+  2.0 GiB. With `corr_engine_set_memory` a correlation over budget evicts its
+  own groups, lowest progress first, and the same flood under a 64 MiB budget
+  takes 71 MiB. A correlation that holds less than its share of half the
+  budget is never trimmed, so a flood on one rule does not evict another's
+  groups.
 
 ## [4.2.0] - 2026-11-26
 

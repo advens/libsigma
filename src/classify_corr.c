@@ -282,6 +282,11 @@ static int sval_eq(const sval_t* s, const char* v, size_t len, uint64_t h) {
     return memcmp(s->p, v, len < CORR_VALUE_KEEP ? len : CORR_VALUE_KEEP) == 0;
 }
 
+/* Bytes allocated for the stored copy. */
+static size_t sval_bytes(const sval_t* s) {
+    return (s->len < CORR_VALUE_KEEP ? s->len : CORR_VALUE_KEEP) + 1;
+}
+
 static uint64_t sval_hash(const char* v, size_t len) {
     return len > CORR_VALUE_KEEP ? corr_hash(v, len) : 0;
 }
@@ -309,6 +314,7 @@ typedef struct {
     dval_t** buckets;
     uint32_t n_buckets;
     uint32_t count;
+    size_t bytes; /* entries and their stored values */
     dval_t *lru_head, *lru_tail; /* head = LRU (oldest), tail = MRU */
 } dset_t;
 
@@ -391,6 +397,9 @@ struct group {
     uint8_t tier;
     double hits_since;
 
+    size_t bytes; /* charged to the engine, see cstate_settle */
+    size_t fixed_bytes; /* the struct, key array and stored keys */
+
     uint64_t h;
     group_t* hnext; /* hash chain */
     group_t *lru_prev, *lru_next; /* LRU list of its tier (head = LRU oldest) */
@@ -409,6 +418,7 @@ typedef struct {
     group_t* lru_head[CORR_TIERS];
     group_t* lru_tail[CORR_TIERS];
     uint32_t tier_mask; /* bit t set while tier t is non-empty */
+    size_t bytes; /* its groups and bucket table, under lock */
     pthread_mutex_t lock; /* guards this correlation's group map and scratch */
     /* value_percentile / median only: sort copy of a group's ring. */
     double* scratch;
@@ -447,6 +457,12 @@ struct corr_engine {
     double max_ahead_s, max_behind_s;
     uint64_t ts_nonfinite, ts_ahead, ts_behind; /* relaxed-atomic */
     uint64_t groups_evicted_progress; /* relaxed-atomic */
+
+    /* Memory budget (corr_engine_set_memory), set before the engine is shared.
+     * bytes is the sum of every state's bytes. */
+    size_t max_bytes, reserve_bytes;
+    size_t bytes; /* relaxed-atomic */
+    uint64_t groups_evicted_memory; /* relaxed-atomic */
 };
 
 /* ---- small helpers ----------------------------------------------------- */
@@ -503,6 +519,7 @@ static void dset_remove(dset_t* d, dval_t* e) {
     if (*pp) *pp = e->hnext;
     dset_unlink_lru(d, e);
     d->count--;
+    d->bytes -= sizeof(*e) + sval_bytes(&e->val);
     free(e->val.p);
     free(e);
 }
@@ -588,6 +605,7 @@ static uint32_t dset_observe(
     d->buckets[b] = ne;
     dset_push_mru(d, ne);
     d->count++;
+    d->bytes += sizeof(*ne) + sval_bytes(&ne->val);
     return d->count;
 }
 
@@ -606,6 +624,7 @@ static void dset_free(dset_t* d) {
     }
     d->buckets = NULL;
     d->n_buckets = d->count = 0;
+    d->bytes = 0;
     d->lru_head = d->lru_tail = NULL;
 }
 
@@ -647,10 +666,38 @@ static group_t* group_new(const char* const* vals, size_t n, uint64_t h, uint32_
             }
         }
     }
+    g->fixed_bytes = sizeof(*g) + n * sizeof(*g->key);
+    for (size_t i = 0; i < n; i++) g->fixed_bytes += sval_bytes(&g->key[i]);
     /* The ring and the distinct set are allocated by the types that use them,
      * on first use. */
     g->ev_max = ev_cap ? ev_cap : 1;
     return g;
+}
+
+/* temporal_ordered: the steps of the sequence. */
+static size_t ord_steps(const corr_rule_t* r) {
+    return (r->ordered_rule_ids && r->n_ordered_rule_ids) ? r->n_ordered_rule_ids : r->n_base_rule_ids;
+}
+
+/* Bytes the group holds: what corr_engine_set_memory counts. */
+static size_t group_bytes(const corr_rule_t* r, const group_t* g) {
+    size_t b = g->fixed_bytes + (size_t)g->ev_cap * sizeof(double) * (g->ev_val ? 2u : 1u);
+    b += (size_t)g->bb_cap * sizeof(beacon_bucket_t);
+    if (g->seen) b += sizeof(*g->seen);
+    if (g->ord) b += sizeof(*g->ord) * (ord_steps(r) - 1);
+    if (g->wm) b += sizeof(*g->wm) * CORR_WM_CAP;
+    if (g->distinct.buckets) b += g->distinct.n_buckets * sizeof(*g->distinct.buckets) + g->distinct.bytes;
+    return b;
+}
+
+static void mem_charge(corr_engine_t* e, corr_state_t* st, size_t n) {
+    st->bytes += n;
+    __atomic_fetch_add(&e->bytes, n, __ATOMIC_RELAXED);
+}
+
+static void mem_release(corr_engine_t* e, corr_state_t* st, size_t n) {
+    st->bytes -= n;
+    __atomic_fetch_sub(&e->bytes, n, __ATOMIC_RELAXED);
 }
 
 /* ============================================================================
@@ -703,17 +750,59 @@ static void group_credit(group_t* g, uint32_t n, double ts, double window) {
     g->tier = (uint8_t)(t < CORR_TIERS ? t : CORR_TIERS - 1u);
 }
 
-static void cstate_remove(corr_state_t* st, group_t* g) {
+static void cstate_remove(corr_engine_t* e, corr_state_t* st, group_t* g) {
     uint32_t b = (uint32_t)(g->h & (st->n_buckets - 1));
     group_t** pp = &st->buckets[b];
     while (*pp && *pp != g) pp = &(*pp)->hnext;
     if (*pp) *pp = g->hnext;
     cstate_unlink_lru(st, g);
     st->count--;
+    mem_release(e, st, g->bytes);
     group_free(g);
 }
 
-static int cstate_grow(corr_state_t* st) {
+/* The least recently used group of the lowest tier, other than keep. */
+static group_t* cstate_victim(const corr_state_t* st, const group_t* keep) {
+    for (uint32_t m = st->tier_mask; m; m &= m - 1) {
+        group_t* g = st->lru_head[__builtin_ctz(m)];
+        if (g == keep) g = g->lru_next;
+        if (g) return g;
+    }
+    return NULL;
+}
+
+/* Over budget, a correlation above its reserve evicts its own groups, lowest
+ * tier first, until the engine is back under budget or it is at its reserve.
+ * Only the correlation's own lock is held, and one below its reserve is never
+ * trimmed, so a flood on one correlation cannot evict another's groups. */
+static void cstate_trim(corr_engine_t* e, corr_state_t* st, const group_t* keep) {
+    if (e->max_bytes == 0) return;
+    while (st->bytes > e->reserve_bytes && __atomic_load_n(&e->bytes, __ATOMIC_RELAXED) > e->max_bytes) {
+        group_t* v = cstate_victim(st, keep);
+        if (!v) return;
+        cstate_remove(e, st, v);
+        CS_INC(e, groups_evicted_memory);
+    }
+}
+
+/* Charge g's change in size since the last call, then trim. Every path that
+ * created or changed g calls this before it drops st->lock. */
+static void cstate_settle(corr_engine_t* e, corr_state_t* st, group_t* g) {
+    const size_t b = group_bytes(st->rule, g);
+    if (b > g->bytes)
+        mem_charge(e, st, b - g->bytes);
+    else if (b < g->bytes)
+        mem_release(e, st, g->bytes - b);
+    g->bytes = b;
+    cstate_trim(e, st, g);
+}
+
+static void cstate_unlock(corr_engine_t* e, corr_state_t* st, group_t* g) {
+    cstate_settle(e, st, g);
+    pthread_mutex_unlock(&st->lock);
+}
+
+static int cstate_grow(corr_engine_t* e, corr_state_t* st) {
     uint32_t nn = st->n_buckets << 1;
     group_t** nb = calloc(nn, sizeof(*nb));
     if (!nb) return -1;
@@ -728,6 +817,7 @@ static int cstate_grow(corr_state_t* st) {
         }
     }
     free(st->buckets);
+    mem_charge(e, st, (size_t)(nn - st->n_buckets) * sizeof(*nb));
     st->buckets = nb;
     st->n_buckets = nn;
     return 0;
@@ -752,13 +842,13 @@ static group_t* cstate_get_or_create(
     }
     if (st->count >= e->caps.max_groups && st->tier_mask) {
         const unsigned t = (unsigned)__builtin_ctz(st->tier_mask);
-        cstate_remove(st, st->lru_head[t]);
+        cstate_remove(e, st, st->lru_head[t]);
         CS_INC(&e->stats, groups_evicted);
         if (t > 0) CS_INC(e, groups_evicted_progress);
     }
 
     if (st->count + 1 > (st->n_buckets * 3) / 4) {
-        (void)cstate_grow(st);
+        (void)cstate_grow(e, st);
         b = (uint32_t)(h & (st->n_buckets - 1));
     }
     group_t* g = group_new(vals, n, h, e->caps.max_events_per_group);
@@ -772,7 +862,7 @@ static group_t* cstate_get_or_create(
 }
 
 /* Drop groups whose last_update < horizon (the periodic sweep). */
-static void cstate_drop_expired(corr_state_t* st, double horizon) {
+static void cstate_drop_expired(corr_engine_t* e, corr_state_t* st, double horizon) {
     /* Walk every tier; a group's last_update is event time, not recency, so
      * scan all (bounded by max_groups). Snapshot-free deletion is safe because
      * cstate_remove only touches the node + its neighbours in its own tier. */
@@ -780,7 +870,7 @@ static void cstate_drop_expired(corr_state_t* st, double horizon) {
         group_t* g = st->lru_head[t];
         while (g) {
             group_t* nx = g->lru_next;
-            if (g->last_update < horizon) cstate_remove(st, g);
+            if (g->last_update < horizon) cstate_remove(e, st, g);
             g = nx;
         }
     }
@@ -946,6 +1036,7 @@ corr_engine_t* corr_engine_new(const corr_rule_t* rules, size_t n, corr_caps_t c
             return NULL;
         }
         pthread_mutex_init(&st->lock, NULL);
+        mem_charge(e, st, st->n_buckets * sizeof(*st->buckets));
         admitted++;
     }
     e->n_states = admitted;
@@ -1572,7 +1663,7 @@ static int eval_temporal_ordered(const corr_rule_t* r,
                                  int event_time,
                                  corr_stats_t* stats) {
     const uint32_t* order = (r->ordered_rule_ids && r->n_ordered_rule_ids) ? r->ordered_rule_ids : r->base_rule_ids;
-    size_t n = (r->ordered_rule_ids && r->n_ordered_rule_ids) ? r->n_ordered_rule_ids : r->n_base_rule_ids;
+    size_t n = ord_steps(r);
     if (n == 0) return 0;
     if (n > 1 && g->ord == NULL) {
         g->ord = malloc(sizeof(*g->ord) * (n - 1));
@@ -1686,6 +1777,18 @@ uint64_t corr_engine_groups_evicted_progress(const corr_engine_t* e) {
     return e ? __atomic_load_n(&e->groups_evicted_progress, __ATOMIC_RELAXED) : 0;
 }
 
+int corr_engine_set_memory(corr_engine_t* e, size_t max_bytes) {
+    if (!e) return -1;
+    e->max_bytes = max_bytes;
+    e->reserve_bytes = e->n_states ? max_bytes / 2 / e->n_states : 0;
+    return 0;
+}
+
+void corr_engine_memory_stats(const corr_engine_t* e, uint64_t* bytes, uint64_t* evicted) {
+    if (bytes) *bytes = e ? (uint64_t)__atomic_load_n(&e->bytes, __ATOMIC_RELAXED) : 0;
+    if (evicted) *evicted = e ? __atomic_load_n(&e->groups_evicted_memory, __ATOMIC_RELAXED) : 0;
+}
+
 void corr_engine_clock_stats(const corr_engine_t* e, uint64_t* nonfinite, uint64_t* ahead, uint64_t* behind) {
     if (nonfinite) *nonfinite = e ? __atomic_load_n(&e->ts_nonfinite, __ATOMIC_RELAXED) : 0;
     if (ahead) *ahead = e ? __atomic_load_n(&e->ts_ahead, __ATOMIC_RELAXED) : 0;
@@ -1744,7 +1847,8 @@ static void sweep_if_due(corr_engine_t* e, double now) {
         int32_t ts = e->states[i].rule->timespan_s;
         if (ts > 0) {
             pthread_mutex_lock(&e->states[i].lock);
-            cstate_drop_expired(&e->states[i], now - (double)ts);
+            cstate_drop_expired(e, &e->states[i], now - (double)ts);
+            cstate_trim(e, &e->states[i], NULL);
             pthread_mutex_unlock(&e->states[i].lock);
         }
     }
@@ -1865,7 +1969,7 @@ int corr_on_event_apply(corr_engine_t* e,
                     }
             }
             if (n_hit == 0) {
-                pthread_mutex_unlock(&st->lock);
+                cstate_unlock(e, st, gs);
                 continue; /* none of this correlation's bases on this event */
             }
 
@@ -1921,13 +2025,13 @@ int corr_on_event_apply(corr_engine_t* e,
             }
 
             if (!fired_now) {
-                pthread_mutex_unlock(&st->lock);
+                cstate_unlock(e, st, gs);
                 continue;
             }
 
             /* Re-fire suppression: stay lit for one window after firing. */
             if (ts < gs->fired_until) {
-                pthread_mutex_unlock(&st->lock);
+                cstate_unlock(e, st, gs);
                 CS_INC(&e->stats, fires_suppressed);
                 continue;
             }
@@ -1952,7 +2056,7 @@ int corr_on_event_apply(corr_engine_t* e,
             } else {
                 observed_val = (int64_t)r->n_base_rule_ids;
             }
-            pthread_mutex_unlock(&st->lock);
+            cstate_unlock(e, st, gs);
 
             /* Build the activation.  out[] and grp_scratch are caller-owned,
              * per-worker storage, so no engine lock is held here. */
@@ -2095,11 +2199,11 @@ int corr_on_contribution(corr_engine_t* e,
     }
 
     if (!fired_now) {
-        pthread_mutex_unlock(&st->lock);
+        cstate_unlock(e, st, gs);
         return 0;
     }
     if (ts < gs->fired_until) {
-        pthread_mutex_unlock(&st->lock);
+        cstate_unlock(e, st, gs);
         CS_INC(&e->stats, fires_suppressed);
         return 0;
     }
@@ -2117,7 +2221,7 @@ int corr_on_contribution(corr_engine_t* e,
     } else {
         observed_val = (int64_t)r->n_base_rule_ids;
     }
-    pthread_mutex_unlock(&st->lock);
+    cstate_unlock(e, st, gs);
 
     if (max_out == 0 || out == NULL) {
         CS_INC(&e->stats, fires_truncated);
