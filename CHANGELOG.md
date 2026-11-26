@@ -18,6 +18,10 @@ are unchanged.
 - `corr_engine_set_memory` bounds the bytes of group state across all
   correlations. `corr_engine_memory_stats` returns the bytes in use and how
   many groups were evicted to keep the budget.
+- `corr_rule_group_fields` returns the group-by fields the engine reads for
+  an event's matched rules, aliases included, and `corr_value_number` parses
+  a numeric value as the engine does. A peer that sends a partial for an
+  event it does not own uses them to send what the owner would apply.
 
 ### Security
 
