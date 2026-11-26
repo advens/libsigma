@@ -1425,6 +1425,67 @@ static void test_evict_by_progress(void) {
     corr_engine_free(e);
 }
 
+/* A stored key or distinct value keeps its first 256 bytes, its length and a
+ * hash of the rest. Values that share those 256 bytes must still be told
+ * apart, by their tail or by their length, and the fire must report the
+ * caller's whole value. */
+static void test_long_values(void) {
+    enum { LONG = 64 * 1024 };
+    char* a = malloc(LONG + 1);
+    char* b = malloc(LONG + 1);
+    char* c = malloc(LONG + 2);
+    if (!a || !b || !c) {
+        CHECK(0, "long: allocation");
+        free(a);
+        free(b);
+        free(c);
+        return;
+    }
+    memset(a, 'x', LONG);
+    a[LONG] = '\0';
+    memcpy(b, a, LONG + 1);
+    b[LONG - 1] = 'y'; /* same first 256 bytes and length, other tail */
+    memcpy(c, a, LONG);
+    c[LONG] = 'x';
+    c[LONG + 1] = '\0'; /* a's bytes and one more */
+
+    corr_rule_t r = mk_event_count(); /* >= 10 in 300 s, by ip + user */
+    corr_engine_t* e = corr_engine_new(&r, 1, corr_caps_default());
+    int fired = 0;
+    corr_fire_t f;
+    memset(&f, 0, sizeof(f));
+    for (int i = 0; i < 4; i++) {
+        fired += feed(e, "10.0.0.1", a, BASE_1, 1, 100.0 + i, &f);
+        fired += feed(e, "10.0.0.1", b, BASE_1, 1, 100.0 + i, &f);
+        fired += feed(e, "10.0.0.1", c, BASE_1, 1, 100.0 + i, &f);
+    }
+    CHECK(corr_engine_groups_for(e, "brute") == 3, "long: a shared 256-byte head does not merge groups");
+    CHECK(fired == 0, "long: 12 events over 3 groups do not fire");
+    for (int i = 0; i < 6; i++) fired += feed(e, "10.0.0.1", b, BASE_1, 1, 110.0 + i, &f);
+    CHECK(fired == 1, "long: the 10th event of one long-keyed group fires");
+    CHECK(fired == 1 && f.n_group == 2 && f.group != NULL && strlen(f.group[1]) == LONG &&
+              memcmp(f.group[1], b, LONG) == 0,
+          "long: the fire reports the whole value");
+    corr_engine_free(e);
+
+    corr_rule_t v = mk_value_count(); /* >= 5 distinct user.name by ip */
+    e = corr_engine_new(&v, 1, corr_caps_default());
+    fired = 0;
+    for (int i = 0; i < 3; i++) {
+        fired += feed(e, "10.0.0.2", a, BASE_1, 1, 100.0 + i, NULL);
+        fired += feed(e, "10.0.0.2", b, BASE_1, 1, 100.0 + i, NULL);
+        fired += feed(e, "10.0.0.2", c, BASE_1, 1, 100.0 + i, NULL);
+    }
+    CHECK(fired == 0, "long: three long values repeated are three distinct values");
+    fired += feed(e, "10.0.0.2", "u4", BASE_1, 1, 104.0, NULL);
+    fired += feed(e, "10.0.0.2", "u5", BASE_1, 1, 105.0, NULL);
+    CHECK(fired == 1, "long: the fifth distinct value fires");
+    corr_engine_free(e);
+    free(a);
+    free(b);
+    free(c);
+}
+
 /* The ring starts small and doubles. Growth must keep every live entry in
  * order, also when the head has wrapped, for the time ring and the value ring
  * that moves with it. At the cap the oldest entry is overwritten. */
@@ -1502,6 +1563,7 @@ int main(void) {
     test_beaconing_bucketed();
     test_group_by_aliases();
     test_ring_growth();
+    test_long_values();
     test_evict_by_progress();
     test_receive_clock();
 
