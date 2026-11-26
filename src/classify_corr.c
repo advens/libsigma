@@ -250,9 +250,47 @@ static uint64_t hash_group_key(const char* const* vals, size_t n) {
     return sip_final(&s);
 }
 
-static int group_key_eq(const char* const* a, const char* const* b, size_t n) {
-    for (size_t i = 0; i < n; i++)
-        if (strcmp(a[i], b[i]) != 0) return 0;
+/* A group-key or distinct value as the engine stores it. Event fields are
+ * sender-controlled, so a stored copy keeps at most CORR_VALUE_KEEP bytes. A
+ * longer value keeps its first CORR_VALUE_KEEP bytes, its length, and the keyed
+ * hash of all its bytes, and two values are equal when all three match. The
+ * hash key is random per process, so a sender cannot pick a long value that
+ * collides with another one. */
+#define CORR_VALUE_KEEP 256
+
+typedef struct {
+    char* p; /* min(len, CORR_VALUE_KEEP) bytes, NUL-terminated */
+    size_t len; /* length of the original value */
+    uint64_t h; /* corr_hash of the original value when len > CORR_VALUE_KEEP */
+} sval_t;
+
+static int sval_set(sval_t* s, const char* v, size_t len, uint64_t h) {
+    const size_t keep = len < CORR_VALUE_KEEP ? len : CORR_VALUE_KEEP;
+    s->p = malloc(keep + 1);
+    if (!s->p) return -1;
+    memcpy(s->p, v, keep);
+    s->p[keep] = '\0';
+    s->len = len;
+    s->h = len > CORR_VALUE_KEEP ? h : 0;
+    return 0;
+}
+
+/* h is corr_hash(v, len), or 0 when len <= CORR_VALUE_KEEP. */
+static int sval_eq(const sval_t* s, const char* v, size_t len, uint64_t h) {
+    if (s->len != len) return 0;
+    if (len > CORR_VALUE_KEEP && s->h != h) return 0;
+    return memcmp(s->p, v, len < CORR_VALUE_KEEP ? len : CORR_VALUE_KEEP) == 0;
+}
+
+static uint64_t sval_hash(const char* v, size_t len) {
+    return len > CORR_VALUE_KEEP ? corr_hash(v, len) : 0;
+}
+
+static int group_key_eq(const sval_t* a, const char* const* b, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        const size_t len = strlen(b[i]);
+        if (!sval_eq(&a[i], b[i], len, sval_hash(b[i], len))) return 0;
+    }
     return 1;
 }
 
@@ -260,7 +298,7 @@ static int group_key_eq(const char* const* a, const char* const* b, size_t n) {
  * Distinct-value LRU set (value_count).  Open-chained hash + intrusive LRU.
  * ========================================================================== */
 typedef struct dval {
-    char* val; /* owned copy */
+    sval_t val; /* bounded copy */
     double ts; /* latest monotonic ts seen */
     uint64_t h;
     struct dval* hnext; /* hash chain */
@@ -292,7 +330,7 @@ typedef struct {
 } beacon_bucket_t;
 
 struct group {
-    char** key; /* owned copies of the group-by VALUES (n_group_by) */
+    sval_t* key; /* bounded copies of the group-by VALUES (n_group_by) */
     size_t n_key;
 
     /* event_count / value / beaconing raw: ring of event times. Allocated on
@@ -465,14 +503,14 @@ static void dset_remove(dset_t* d, dval_t* e) {
     if (*pp) *pp = e->hnext;
     dset_unlink_lru(d, e);
     d->count--;
-    free(e->val);
+    free(e->val.p);
     free(e);
 }
 
 static dval_t* dset_find(dset_t* d, const char* val, size_t len, uint64_t h) {
     uint32_t b = (uint32_t)(h & (d->n_buckets - 1));
     for (dval_t* e = d->buckets[b]; e; e = e->hnext)
-        if (e->h == h && strlen(e->val) == len && memcmp(e->val, val, len) == 0) return e;
+        if (e->h == h && sval_eq(&e->val, val, len, h)) return e;
     return NULL;
 }
 
@@ -538,14 +576,11 @@ static uint32_t dset_observe(
         if (stats) CS_INC(stats, oom_dropped);
         return d->count; /* OOM: count stays, threshold may have fired */
     }
-    ne->val = malloc(len + 1);
-    if (!ne->val) {
+    if (sval_set(&ne->val, val, len, h) != 0) {
         free(ne);
         if (stats) CS_INC(stats, oom_dropped);
         return d->count;
     }
-    memcpy(ne->val, val, len);
-    ne->val[len] = '\0';
     ne->ts = ts;
     ne->h = h;
     uint32_t b = (uint32_t)(h & (d->n_buckets - 1));
@@ -562,7 +597,7 @@ static void dset_free(dset_t* d) {
             dval_t* e = d->buckets[i];
             while (e) {
                 dval_t* nx = e->hnext;
-                free(e->val);
+                free(e->val.p);
                 free(e);
                 e = nx;
             }
@@ -580,7 +615,7 @@ static void dset_free(dset_t* d) {
 static void group_free(group_t* g) {
     if (!g) return;
     if (g->key) {
-        for (size_t i = 0; i < g->n_key; i++) free(g->key[i]);
+        for (size_t i = 0; i < g->n_key; i++) free(g->key[i].p);
         free(g->key);
     }
     free(g->ev_ts);
@@ -599,19 +634,17 @@ static group_t* group_new(const char* const* vals, size_t n, uint64_t h, uint32_
     g->h = h;
     g->n_key = n;
     if (n > 0) {
-        g->key = calloc(n, sizeof(char*));
+        g->key = calloc(n, sizeof(*g->key));
         if (!g->key) {
             group_free(g);
             return NULL;
         }
         for (size_t i = 0; i < n; i++) {
-            size_t len = strlen(vals[i]);
-            g->key[i] = malloc(len + 1);
-            if (!g->key[i]) {
+            const size_t len = strlen(vals[i]);
+            if (sval_set(&g->key[i], vals[i], len, sval_hash(vals[i], len)) != 0) {
                 group_free(g);
                 return NULL;
             }
-            memcpy(g->key[i], vals[i], len + 1);
         }
     }
     /* The ring and the distinct set are allocated by the types that use them,
@@ -710,7 +743,7 @@ static group_t* cstate_get_or_create(
     uint64_t h = hash_group_key(vals, n);
     uint32_t b = (uint32_t)(h & (st->n_buckets - 1));
     for (group_t* g = st->buckets[b]; g; g = g->hnext) {
-        if (g->h == h && g->n_key == n && group_key_eq((const char* const*)g->key, vals, n)) {
+        if (g->h == h && g->n_key == n && group_key_eq(g->key, vals, n)) {
             cstate_unlink_lru(st, g);
             group_credit(g, hits, ts, window);
             cstate_push_mru(st, g);

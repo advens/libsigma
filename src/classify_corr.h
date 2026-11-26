@@ -55,6 +55,8 @@
  *   3. periodic global sweep (sweep_interval_s) drops fully-expired groups
  *   4. value_count distinct-set cap (max_distinct, default 10000) per group
  *   5. per-group event ring cap (max_events_per_group, default 4096)
+ *   6. a stored group-by or distinct value keeps at most 256 bytes; a longer
+ *      one keeps its first 256 bytes, its length and a keyed hash of all of it
  * Worst-case memory ~= n_corr * max_groups * (event_budget | max_distinct):
  * finite and operator-tunable, never a function of adversary-controlled
  * cardinality.

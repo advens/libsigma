@@ -10,6 +10,17 @@ is called out explicitly.
 
 ## [Unreleased]
 
+PATCH: no change to the C ABI, the `.sigmac` format, or the contrib wire.
+
+### Security
+
+- A correlation group key and a distinct value were stored as full copies
+  of the event field, and the sender sets its length: 2000 events with a
+  64 KiB `user.name` took 251 MiB in one event_count and one value_count
+  correlation. A stored value now keeps its first 256 bytes, its length and
+  a keyed hash of all of it, and the same events take 2.1 MiB. Values that
+  share their first 256 bytes stay distinct.
+
 ## [4.2.0] - 2026-11-26
 
 MINOR: additive C ABI. The SONAME, the `.sigmac` format, and the contrib wire
