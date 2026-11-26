@@ -1486,6 +1486,64 @@ static void test_long_values(void) {
     free(c);
 }
 
+/* The byte count must return to its start when every group expires, and with
+ * a budget a flood of new keys on one rule must stay near the budget, keep a
+ * group with progress, and leave another rule able to fire. */
+static const uint32_t BASE_2[] = {2};
+
+static void test_memory_budget(void) {
+    uint64_t b0, b, ev;
+    corr_rule_t r = mk_event_count(); /* >= 10 in 300 s, by ip + user */
+    corr_engine_t* e = corr_engine_new(&r, 1, corr_caps_default());
+    corr_engine_memory_stats(e, &b0, NULL);
+    CHECK(b0 > 0, "mem: the bucket table is counted");
+    feed(e, "10.0.0.1", "a", BASE_1, 1, 100.0, NULL);
+    feed(e, "10.0.0.2", "b", BASE_1, 1, 100.0, NULL);
+    feed(e, "10.0.0.3", "c", BASE_1, 1, 100.0, NULL);
+    corr_engine_memory_stats(e, &b, NULL);
+    CHECK(b > b0, "mem: groups are counted");
+    feed(e, "10.0.0.9", "z", BASE_2, 1, 100.0 + 300.0 + 60.0, NULL); /* sweep only */
+    corr_engine_memory_stats(e, &b, NULL);
+    CHECK(corr_engine_total_groups(e) == 0 && b == b0, "mem: expired groups give their bytes back");
+    corr_engine_free(e);
+
+    enum { BUDGET = 512 * 1024, FLOOD = 200000 };
+    corr_rule_t rules[2] = {mk_event_count(), mk_event_count()};
+    rules[1].id = "brute2";
+    rules[1].base_rule_ids = BASE_2;
+    e = corr_engine_new(rules, 2, corr_caps_default());
+    CHECK(corr_engine_set_memory(e, BUDGET) == 0, "mem: set the budget");
+    CHECK(corr_engine_set_memory(NULL, BUDGET) == -1, "mem: NULL engine refused");
+    int fired = 0;
+    for (int i = 0; i < 9; i++) fired += feed(e, "10.1.0.1", "hot", BASE_1, 1, 100.0, NULL);
+    uint64_t peak = 0;
+    char ip[32];
+    for (int i = 0; i < FLOOD; i++) {
+        snprintf(ip, sizeof(ip), "10.%d.%d.%d", 2 + (i >> 16), (i >> 8) & 255, i & 255);
+        feed(e, ip, "flood", BASE_1, 1, 101.0, NULL);
+        corr_engine_memory_stats(e, &b, NULL);
+        if (b > peak) peak = b;
+    }
+    corr_engine_memory_stats(e, &b, &ev);
+    CHECK(peak <= BUDGET + 4096, "mem: a flood of new keys stays at the budget");
+    CHECK(ev > 0 && corr_engine_groups_for(e, "brute") < FLOOD / 10, "mem: the flood evicts its own groups");
+    fired += feed(e, "10.1.0.1", "hot", BASE_1, 1, 102.0, NULL);
+    CHECK(fired == 1, "mem: a group with progress survives the flood and fires");
+    fired = 0;
+    for (int i = 0; i < 10; i++) fired += feed(e, "10.9.0.1", "other", BASE_2, 1, 103.0, NULL);
+    CHECK(fired == 1, "mem: another rule still fires after the flood");
+    CHECK(corr_engine_groups_for(e, "brute2") == 1, "mem: the other rule keeps its group");
+    corr_engine_free(e);
+
+    /* A budget below one group still keeps the group the event updated. */
+    e = corr_engine_new(&r, 1, corr_caps_default());
+    corr_engine_set_memory(e, 1);
+    fired = 0;
+    for (int i = 0; i < 10; i++) fired += feed(e, "10.0.0.5", "x", BASE_1, 1, 100.0, NULL);
+    CHECK(fired == 1 && corr_engine_groups_for(e, "brute") == 1, "mem: the updated group is never the one evicted");
+    corr_engine_free(e);
+}
+
 /* The ring starts small and doubles. Growth must keep every live entry in
  * order, also when the head has wrapped, for the time ring and the value ring
  * that moves with it. At the cap the oldest entry is overwritten. */
@@ -1564,6 +1622,7 @@ int main(void) {
     test_group_by_aliases();
     test_ring_growth();
     test_long_values();
+    test_memory_budget();
     test_evict_by_progress();
     test_receive_clock();
 

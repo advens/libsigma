@@ -57,9 +57,11 @@
  *   5. per-group event ring cap (max_events_per_group, default 4096)
  *   6. a stored group-by or distinct value keeps at most 256 bytes; a longer
  *      one keeps its first 256 bytes, its length and a keyed hash of all of it
+ *   7. optional engine-wide byte budget (corr_engine_set_memory)
  * Worst-case memory ~= n_corr * max_groups * (event_budget | max_distinct):
  * finite and operator-tunable, never a function of adversary-controlled
- * cardinality.
+ * cardinality. With a budget set, group state stays near max_bytes whatever
+ * the number of correlations.
  *
  * Copyright 2026 Advens.
  * Author: Jeremie Jourdin <jeremie.jourdin@advens.fr>
@@ -301,6 +303,29 @@ int corr_engine_set_clock(corr_engine_t* e, corr_clock_fn now_fn, void* ctx, dou
  * map evicts groups with one recent hit first, so a non-zero rate means the
  * map is too small for the traffic or someone is pushing real groups out. */
 uint64_t corr_engine_groups_evicted_progress(const corr_engine_t* e);
+
+/* Bound the bytes of group state across all correlations: groups, their keys,
+ * rings, distinct sets and per-type tables, and each correlation's bucket
+ * table. Allocator overhead and the fixed per-rule tables are not counted.
+ *
+ * When an event leaves the engine above max_bytes, its correlation evicts its
+ * own groups, least recently used of the lowest progress tier first, never the
+ * group the event just updated, until the engine is under max_bytes or the
+ * correlation holds max_bytes / (2 * rules) or less. A correlation at or below
+ * that reserve is never trimmed, so a flood on one rule cannot push another
+ * rule's groups out. The periodic sweep applies the same rule to every
+ * correlation. Between sweeps the total can exceed max_bytes by the reserves
+ * of correlations that grew since, at most max_bytes / 2, plus what events in
+ * flight add.
+ *
+ * max_bytes 0 (the default) removes the budget; bytes are counted either way.
+ * Call before the engine is shared between threads. Returns 0, or -1 on a
+ * NULL engine. */
+int corr_engine_set_memory(corr_engine_t* e, size_t max_bytes);
+
+/* Bytes of group state now, and groups evicted to keep the budget. Any
+ * pointer may be NULL. */
+void corr_engine_memory_stats(const corr_engine_t* e, uint64_t* bytes, uint64_t* evicted);
 
 /* Event times refused or replaced for being non-finite, and clamped for being
  * ahead of or behind the clock. Any pointer may be NULL. */
