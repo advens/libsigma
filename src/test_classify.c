@@ -1158,6 +1158,73 @@ static void test_watermark_reorder(void) {
     corr_engine_free(e);
 }
 
+/* The apply callback sees the group values the engine resolved. */
+typedef struct {
+    const char* g0;
+} apply_seen_t;
+
+static int apply_record(void* ctx, const corr_rule_t* r, const char* const* g, size_t n) {
+    (void)r;
+    ((apply_seen_t*)ctx)->g0 = n > 0 ? g[0] : NULL;
+    return 0;
+}
+
+/* A peer reads its partial's group values through corr_rule_group_fields, so
+ * those fields must give the values the engine itself resolves (what the apply
+ * callback sees) for every order of matched rids. */
+static void test_rule_group_fields(void) {
+    static const uint32_t BASE[] = {1, 2, 3};
+    static const char* GB[] = {"user.name"};
+    static const char* ALIAS2[] = {"user.target.name"};
+    static const char* const* ALIASES[] = {NULL, ALIAS2, NULL};
+    corr_rule_t r;
+    memset(&r, 0, sizeof(r));
+    r.id = "fields";
+    r.type = CORR_EVENT_COUNT;
+    r.base_rule_ids = BASE;
+    r.n_base_rule_ids = 3;
+    r.group_by = GB;
+    r.n_group_by = 1;
+    r.alias_group_by = ALIASES;
+    r.n_alias_group_by = 3;
+    r.cond_op = CORR_OP_GTE;
+    r.cond_count = 100;
+    r.timespan_s = 300;
+    r.level = "low";
+
+    corr_engine_t* e = corr_engine_new(&r, 1, corr_caps_default());
+    const corr_rule_t* er = corr_engine_rule_at(e, 0);
+    kv_t kv[] = {{"user.name", "base"}, {"user.target.name", "alias"}};
+    event_t ev = {kv, 2};
+    static const char* scratch[8];
+    static const uint32_t ORDERS[][3] = {{2, 0, 0}, {1, 2, 0}, {2, 1, 0}, {9, 2, 3}, {9, 3, 2}, {9, 0, 0}};
+    static const size_t LENS[] = {1, 2, 2, 3, 3, 1};
+    int same = 1;
+    for (size_t i = 0; i < sizeof(LENS) / sizeof(LENS[0]); i++) {
+        apply_seen_t seen = {NULL};
+        corr_on_event_apply(e, ORDERS[i], LENS[i], ev_field, &ev, 100.0, NULL, 0, scratch, 8, apply_record, &seen);
+        const char* const* f = corr_rule_group_fields(er, ORDERS[i], LENS[i]);
+        const char* mine = (f && f[0]) ? ev_field(&ev, f[0]) : NULL;
+        int matched = LENS[i] > 1 || ORDERS[i][0] != 9;
+        if (matched ? (seen.g0 == NULL || mine == NULL || strcmp(seen.g0, mine) != 0) : (f != GB)) same = 0;
+    }
+    CHECK(same, "fields: a partial reads the group values the engine applies");
+    CHECK(corr_rule_group_fields(er, ORDERS[0], 1) == ALIAS2, "fields: alias of the matched base");
+    CHECK(corr_rule_group_fields(er, ORDERS[1], 2) == GB, "fields: the first matched base decides");
+    CHECK(corr_rule_group_fields(er, NULL, 0) == GB, "fields: no rids gives group_by");
+    CHECK(corr_rule_group_fields(NULL, ORDERS[0], 1) == NULL, "fields: NULL rule");
+    corr_engine_free(e);
+
+    double v = 7.0;
+    CHECK(corr_value_number("1500/tcp", &v) == 1 && v == 1500.0, "number: trailing text ignored");
+    CHECK(corr_value_number("-2.5e3", &v) == 1 && v == -2500.0, "number: sign and exponent");
+    v = 7.0;
+    CHECK(corr_value_number("abc", &v) == 0 && v == 7.0, "number: not a number");
+    CHECK(corr_value_number("1e999", &v) == 0 && corr_value_number("nan", &v) == 0, "number: not finite");
+    CHECK(corr_value_number("", &v) == 0 && corr_value_number(NULL, &v) == 0, "number: empty or missing");
+    CHECK(corr_value_number("1", NULL) == 0, "number: NULL out");
+}
+
 static void test_group_by_aliases(void) {
     /* Two base rules, same group slot, different field names. Events that
      * only carry the aliased field must still land in one group. */
@@ -1623,6 +1690,7 @@ int main(void) {
     test_ring_growth();
     test_long_values();
     test_memory_budget();
+    test_rule_group_fields();
     test_evict_by_progress();
     test_receive_clock();
 

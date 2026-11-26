@@ -444,6 +444,17 @@ const corr_rule_t* corr_engine_rule_at(const corr_engine_t* e, size_t i);
 
 int corr_rule_hits(const corr_rule_t* r, const uint32_t* rids, size_t n_rids);
 
+/* The n_group_by field names the engine reads for an event that matched
+ * rids: the alias list of the first rid that is a base rule of r, else
+ * group_by. A peer that sends a partial for the event reads its group values
+ * from these, so the owner sees the values it would have applied. */
+const char* const* corr_rule_group_fields(const corr_rule_t* r, const uint32_t* rids, size_t n_rids);
+
+/* Parse a value_sum / value_avg / percentile / median value as the engine
+ * does: a leading decimal, trailing text ignored, finite. Returns 1 and sets
+ * *out, or 0 when the engine skips the event (and a peer sends no partial). */
+int corr_value_number(const char* s, double* out);
+
 /* A contribution is a compact, transport-agnostic input to the engine. The
  * local pipeline builds an EVENT contribution from a matched log line
  * (corr_on_event is a wrapper). A remote peer can feed COUNT / SUM / DISTINCT /

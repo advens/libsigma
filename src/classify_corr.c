@@ -2280,6 +2280,22 @@ const corr_rule_t* corr_engine_rule_at(const corr_engine_t* e, size_t i) {
     return e->states[i].rule;
 }
 
+const char* const* corr_rule_group_fields(const corr_rule_t* r, const uint32_t* rids, size_t n_rids) {
+    if (!r) return NULL;
+    if (rids)
+        for (size_t k = 0; k < n_rids; k++)
+            for (size_t b = 0; b < r->n_base_rule_ids; b++)
+                if (r->base_rule_ids[b] == rids[k]) return corr_group_fields(r, rids[k]);
+    return r->group_by;
+}
+
+int corr_value_number(const char* s, double* out) {
+    double v;
+    if (!out || !sg_to_f64(s, s ? strlen(s) : 0, &v)) return 0;
+    *out = v;
+    return 1;
+}
+
 int corr_rule_hits(const corr_rule_t* r, const uint32_t* rids, size_t n_rids) {
     if (!r || !rids || n_rids == 0) return 0;
     for (size_t b = 0; b < r->n_base_rule_ids; b++) {
