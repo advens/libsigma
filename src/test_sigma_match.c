@@ -357,9 +357,39 @@ static int g_pass = 0, g_fail = 0;
         }                                \
     } while (0)
 
+/* Several-values callback over the same event model: every entry whose key
+ * is `name` is one value, in order. Two marker values exercise the contract:
+ * MV_ABSENT makes the callback return -1 (absent), MV_NULLPTR yields an entry
+ * with a NULL pointer, which the engine skips. */
+#define MV_ABSENT "\001absent"
+#define MV_NULLPTR "\001null"
+static int ev_values(void* ctx, const char* name, uint32_t name_len, sigma_val_t* out, int max) {
+    const event_t* e = (const event_t*)ctx;
+    int n = 0;
+    for (int i = 0; i < e->n; i++) {
+        if (strlen(e->kv[i].k) != name_len || memcmp(e->kv[i].k, name, name_len) != 0) continue;
+        if (strcmp(e->kv[i].v, MV_ABSENT) == 0) return -1;
+        if (n < max) {
+            bool np = strcmp(e->kv[i].v, MV_NULLPTR) == 0;
+            out[n].ptr = np ? NULL : e->kv[i].v;
+            out[n].len = np ? 0 : strlen(e->kv[i].v);
+        }
+        n++;
+    }
+    return n;
+}
+
+/* 1 = fires() evaluates through sigma_eval_run_values. */
+static int g_values = 0;
+
+static int run_event(sigma_eval_t* ev, const event_t* e, sigma_hit_t* hits, int max) {
+    if (g_values) return sigma_eval_run_values(ev, ev_values, (void*)e, hits, max);
+    return sigma_eval_run(ev, ev_lookup, (void*)e, hits, max);
+}
+
 static bool fires(sigma_eval_t* ev, const event_t* e, uint32_t rule_id, uint8_t* verdict_out) {
     sigma_hit_t hits[32];
-    int n = sigma_eval_run(ev, ev_lookup, (void*)e, hits, 32);
+    int n = run_event(ev, e, hits, 32);
     for (int i = 0; i < n; i++)
         if (hits[i].rule_id == rule_id) {
             if (verdict_out) *verdict_out = hits[i].verdict;
@@ -2103,6 +2133,196 @@ static void test_loader_rejects_bad_operands(void) {
     }
 }
 
+/* ===========================================================================
+ * Fields with several values (sigma_eval_run_values).  run_battery covers the
+ * one-value case: main runs it through both entry points.  These cases use
+ * the battery rules with a key repeated in the event, one entry per value.
+ * ========================================================================= */
+static void test_multi_values(const sigma_db_t* db) {
+    sigma_eval_t* ev = sigma_eval_create(db);
+    assert(ev);
+    g_values = 1;
+
+    { /* R200: any value of source.ip in the OR list */
+        kv_t kv[] = {{"source.ip", "10.0.0.9"}, {"source.ip", "10.0.0.6"}, {"event.outcome", "failure"}};
+        event_t e = {kv, 3};
+        CHECK(fires(ev, &e, 200, NULL), "values: R200 fires on the second value");
+    }
+    {
+        kv_t kv[] = {{"source.ip", "10.0.0.9"}, {"source.ip", "10.0.0.7"}, {"event.outcome", "failure"}};
+        event_t e = {kv, 3};
+        CHECK(!fires(ev, &e, 200, NULL), "values: R200 no value in the list => no fire");
+    }
+    { /* R300: numeric on any value */
+        kv_t kv[] = {{"destination.port", "443"}, {"destination.port", "8443"}, {"network.transport", "tcp"}};
+        event_t e = {kv, 3};
+        CHECK(fires(ev, &e, 300, NULL), "values: R300 numeric holds on the second value");
+    }
+    { /* R600: CIDR on any value */
+        kv_t kv[] = {{"source.ip", "192.0.2.1"}, {"source.ip", "10.1.2.3"}};
+        event_t e = {kv, 2};
+        CHECK(fires(ev, &e, 600, NULL), "values: R600 CIDR holds on the second value");
+    }
+    {
+        kv_t kv[] = {{"source.ip", "192.0.2.1"}, {"source.ip", "198.51.100.1"}};
+        event_t e = {kv, 2};
+        CHECK(!fires(ev, &e, 600, NULL), "values: R600 no value in the CIDR => no fire");
+    }
+    { /* R700: |re on any value */
+        kv_t kv[] = {{"process.command_line", "dir"}, {"process.command_line", "x Invoke-Mimikatz y"}};
+        event_t e = {kv, 2};
+        CHECK(fires(ev, &e, 700, NULL), "values: R700 |re matches the second value");
+    }
+    { /* R100: contains on any value; values are never joined */
+        kv_t kv[] = {{"process.image", "C:\\x\\PowerShell.exe"},
+                     {"process.command_line", "powershell -File a.ps1"},
+                     {"process.command_line", "powershell -enc ZQ"}};
+        event_t e = {kv, 3};
+        CHECK(fires(ev, &e, 100, NULL), "values: R100 contains on the second value");
+    }
+    {
+        kv_t kv[] = {{"process.image", "C:\\x\\PowerShell.exe"},
+                     {"process.command_line", "x -e"},
+                     {"process.command_line", "nc y"}};
+        event_t e = {kv, 3};
+        CHECK(!fires(ev, &e, 100, NULL), "values: R100 a literal does not span two values");
+    }
+    { /* R904: field|not value holds only when no value is equal */
+        kv_t kv[] = {{"process.name", "powershell.exe"}, {"process.name", "cmd.exe"}};
+        event_t e = {kv, 2};
+        CHECK(!fires(ev, &e, 904, NULL), "values: R904 negated, one value equal => no fire");
+    }
+    {
+        kv_t kv[] = {{"process.name", "powershell.exe"}, {"process.name", "wscript.exe"}};
+        event_t e = {kv, 2};
+        CHECK(fires(ev, &e, 904, NULL), "values: R904 negated, no value equal => fire");
+    }
+    { /* R905: exists holds when any value is non-empty */
+        kv_t kv[] = {{"event.action", "logon"}, {"user.name", ""}, {"user.name", "alice"}};
+        event_t e = {kv, 3};
+        CHECK(!fires(ev, &e, 905, NULL), "values: R905 exists on the second, non-empty value");
+    }
+    {
+        kv_t kv[] = {{"event.action", "logon"}, {"user.name", ""}};
+        event_t e = {kv, 2};
+        CHECK(fires(ev, &e, 905, NULL), "values: R905 only an empty value => field:null fires");
+    }
+    { /* R909: |fieldref, any pair */
+        kv_t kv[] = {
+            {"user.name", "bob"}, {"user.name", "alice"}, {"user.target_name", "carol"}, {"user.target_name", "alice"}};
+        event_t e = {kv, 4};
+        CHECK(fires(ev, &e, 909, NULL), "values: R909 fieldref equal pair (2nd, 2nd) fires");
+    }
+    {
+        kv_t kv[] = {{"user.name", "bob"}, {"user.target_name", "alice"}, {"user.target_name", "carol"}};
+        event_t e = {kv, 3};
+        CHECK(!fires(ev, &e, 909, NULL), "values: R909 fieldref no equal pair => no fire");
+    }
+    { /* callback contract: a negative return is absent, a NULL entry is skipped */
+        kv_t kv[] = {{"event.action", "logon"}, {"user.name", MV_ABSENT}};
+        event_t e = {kv, 2};
+        CHECK(fires(ev, &e, 905, NULL), "values: negative return => field absent");
+    }
+    {
+        kv_t kv[] = {{"process.name", MV_NULLPTR}, {"process.name", "cmd.exe"}};
+        event_t e = {kv, 2};
+        CHECK(!fires(ev, &e, 904, NULL), "values: NULL entry skipped, the next value counts");
+    }
+    { /* truncation: the 17th value is dropped; the negated predicate then holds */
+        kv_t kv[18];
+        for (int i = 0; i < 16; i++) kv[i] = (kv_t){"process.name", "a.exe"};
+        kv[16] = (kv_t){"process.name", "cmd.exe"};
+        event_t e = {kv, 17};
+        sigma_eval_reset_stats(ev);
+        CHECK(fires(ev, &e, 904, NULL), "values: truncated field, negated predicate holds (false positive)");
+        CHECK(sigma_eval_values_truncated(ev) == 1, "values: truncation counted");
+        CHECK(sigma_eval_values_negated_truncated(ev) >= 1, "values: negated-on-truncated counted");
+    }
+    { /* the single-value entry point never counts truncation */
+        kv_t kv[] = {{"process.name", "cmd.exe"}};
+        event_t e = {kv, 1};
+        sigma_eval_reset_stats(ev);
+        g_values = 0;
+        CHECK(!fires(ev, &e, 904, NULL), "values: single-value path unchanged");
+        CHECK(sigma_eval_values_truncated(ev) == 0, "values: single-value path counts nothing");
+        g_values = 1;
+    }
+    { /* NULL-safety of the new entry points */
+        sigma_hit_t h[4];
+        CHECK(sigma_eval_run_values(NULL, ev_values, NULL, h, 4) == 0, "values: NULL eval => 0");
+        CHECK(sigma_eval_run_values(ev, NULL, NULL, h, 4) == 0, "values: NULL callback => 0");
+        CHECK(sigma_eval_values_truncated(NULL) == 0, "values: NULL-safe truncated getter");
+        CHECK(sigma_eval_values_negated_truncated(NULL) == 0, "values: NULL-safe negated getter");
+    }
+
+    g_values = 0;
+    sigma_eval_free(ev);
+}
+
+/* Routing over a field with several values: every value of event.category
+ * selects its bucket, and a rule in two selected buckets runs and is reported
+ * once. */
+static void test_multi_values_routing(void) {
+    tb_t* t = calloc(1, sizeof(*t));
+    assert(t);
+    {
+        uint32_t ps = t->db.n_preds; /* idx 0: url.path|contains "/admin" -> 10 */
+        tb_pred_str(t, "url.path", SIGMA_OP_CONTAINS, "/admin", 0, 0);
+        tb_rule(t, 10, tb_sel(t, ps), 1, 0, 0, SIGMA_VERDICT_ALERT, 2, 20);
+    }
+    {
+        uint32_t ps = t->db.n_preds; /* idx 1: dns.question.name|endswith ".evil.tld" -> 20 */
+        tb_pred_str(t, "dns.question.name", SIGMA_OP_ENDSWITH, ".evil.tld", 0, 0);
+        tb_rule(t, 20, tb_sel(t, ps), 1, 0, 0, SIGMA_VERDICT_ALERT, 3, 35);
+    }
+    (void)tb_field(t, "event.category");
+    uint32_t web[] = {0}, dns[] = {1};
+    tb_bucket(t, "web", web, 1);
+    tb_bucket(t, "proxy", web, 1); /* rule 10 sits in two buckets */
+    tb_bucket(t, "dns", dns, 1);
+
+    sigma_db_t db = tb_finish(t);
+    uint8_t* buf = NULL;
+    size_t len = 0;
+    CHECK(sigma_db_serialize(&db, &buf, &len) == SIGMA_OK, "values route: serialize ok");
+    uint8_t* copy = malloc(len);
+    assert(copy);
+    memcpy(copy, buf, len);
+    sigma_db_t d;
+    memset(&d, 0, sizeof(d));
+    CHECK(sigma_db_load_buffer(copy, len, &d) == SIGMA_OK, "values route: load ok");
+    sigma_eval_t* ev = sigma_eval_create(&d);
+    assert(ev);
+    sigma_hit_t h[8];
+
+    {
+        kv_t kv[] = {{"event.category", "session"}, {"event.category", "dns"}, {"dns.question.name", "a.evil.tld"}};
+        event_t e = {kv, 3};
+        int n = sigma_eval_run_values(ev, ev_values, &e, h, 8);
+        CHECK(n == 1 && h[0].rule_id == 20, "values route: the second category value routes");
+        n = sigma_eval_run(ev, ev_lookup, &e, h, 8);
+        CHECK(n == 0, "values route: the single-value path routes the first value only");
+    }
+    {
+        kv_t kv[] = {{"event.category", "web"}, {"event.category", "proxy"}, {"url.path", "/admin/x"}};
+        event_t e = {kv, 3};
+        int n = sigma_eval_run_values(ev, ev_values, &e, h, 8);
+        CHECK(n == 1 && h[0].rule_id == 10, "values route: a rule in two selected buckets fires once");
+    }
+    {
+        kv_t kv[] = {{"techno", "x"}, {"techno", "dns"}, {"dns.question.name", "a.evil.tld"}};
+        event_t e = {kv, 3};
+        int n = sigma_eval_run_values(ev, ev_values, &e, h, 8);
+        CHECK(n == 1 && h[0].rule_id == 20, "values route: every value of a non-category route field");
+    }
+
+    sigma_eval_free(ev);
+    sigma_db_free(&d);
+    free(buf);
+    sigma_db_free(&db);
+    free(t);
+}
+
 int main(void) {
     tb_t* t = calloc(1, sizeof(*t));
     assert(t);
@@ -2110,8 +2330,14 @@ int main(void) {
     sigma_db_t db = tb_finish(t);
     CHECK(sigma_db_finalize(&db) == 0, "finalize (compile regex) ok");
 
-    /* Pass 1: matcher against the in-memory db. */
+    /* Pass 1: matcher against the in-memory db, through both entry points:
+     * with one value per field, sigma_eval_run_values must agree. */
     run_battery(&db, "in-memory");
+    g_values = 1;
+    run_battery(&db, "in-memory values");
+    g_values = 0;
+    test_multi_values(&db);
+    test_multi_values_routing();
 
     /* Pass 2: serialize -> load -> same battery (artifact round-trip). */
     uint8_t* buf = NULL;

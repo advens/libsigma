@@ -329,6 +329,50 @@ void sigma_eval_free(sigma_eval_t* e);
  * the count is not). */
 int sigma_eval_run(sigma_eval_t* e, sigma_field_fn fn, void* ctx, sigma_hit_t* out, int max_hits);
 
+/* Defined when sigma_eval_run_values and the types below are available. */
+#define SIGMA_HAVE_EVAL_RUN_VALUES 1
+
+/* One value of a field with several values; need not be NUL-terminated. */
+typedef struct {
+    const char* ptr;
+    size_t len;
+} sigma_val_t;
+
+/* Resolve every value of a field (an array such as event.type or related.ip).
+ * Fill up to `max` entries of out[] and return the number of values the field
+ * has; 0 or a negative return means the field is absent, and an entry with a
+ * NULL ptr is skipped. A return above `max` means out[] could not hold them
+ * all: the engine keeps the first `max` and counts the field as truncated.
+ * The out[] pointers must stay valid until sigma_eval_run_values returns. */
+typedef int (*sigma_field_values_fn)(void* ctx, const char* name, uint32_t name_len, sigma_val_t* out, int max);
+
+/* sigma_eval_run for a host whose fields may carry several values.
+ *   - A value predicate (equality, contains, numeric, CIDR, |re) holds when
+ *     any value matches it.
+ *   - A negated predicate holds when no value matches.
+ *   - exists holds when any value is non-empty.
+ *   - |fieldref holds when any value of one field equals any value of the
+ *     other.
+ *   - The literal prefilter scans each value on its own, so a literal never
+ *     spans two values.
+ *   - Every value of a route field selects its bucket; a rule selected by
+ *     several values runs once and is reported once.
+ * The engine keeps a bounded number of values per field and per event. A
+ * field past either bound is truncated (sigma_eval_values_truncated), and a
+ * negated predicate on it can then hold only because the value that matched
+ * was dropped: a false positive, never a missed match
+ * (sigma_eval_values_negated_truncated).
+ * Correlation keys and values stay one string each: the correlation callback
+ * returns one value per field, and a host passes the first value of a list
+ * for group-by, value_count and sum.
+ * With one value per field, the result is the result of sigma_eval_run. */
+int sigma_eval_run_values(sigma_eval_t* e, sigma_field_values_fn fn, void* ctx, sigma_hit_t* out, int max_hits);
+
+/* Fields that lost values to the bounds above, and negated predicates that
+ * held on such a field. Reset by sigma_eval_reset_stats. NULL-safe. */
+uint64_t sigma_eval_values_truncated(const sigma_eval_t* e);
+uint64_t sigma_eval_values_negated_truncated(const sigma_eval_t* e);
+
 /* Set the SIMD literal prefilter mode for this eval scratch:
  *   0 = OFF     , keep bucket narrowing but evaluate EVERY rule in the bucket
  *                  (the oracle for the prefilter soundness gate + the pre-prefilter baseline);

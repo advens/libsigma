@@ -95,7 +95,8 @@ struct sigma_eval {
     const sigma_db_t* db;
     const char** vptr; /* resolved value pointer per field_id */
     size_t* vlen; /* resolved value length per field_id   */
-    uint8_t* vstate; /* 0 = not yet resolved, 1 = resolved (may be NULL value) */
+    uint8_t* vstate; /* 0 = not yet resolved, 1 = resolved (may be NULL value),
+                      * 2 = resolved to several values or truncated (sigma_eval_run_values) */
     pcre2_match_data* md; /* per-worker PCRE2 match scratch, created
                            * lazily, reused across events; keeps
                            * pcre2_match() thread-safe over the shared
@@ -113,7 +114,23 @@ struct sigma_eval {
     sigma_eval_stats_t st; /* prefilter effectiveness counters */
     uint64_t re_unknown; /* |re evaluations that ended on a PCRE2 error */
     int prefilter_on; /* 1 = use Teddy prefilter (default) */
+    /* Fields with several values (sigma_eval_run_values). mfn is set only for
+     * the duration of that call; the single-value path never reads the arrays
+     * below. A field's first value lives in vptr/vlen as on the single-value
+     * path, the rest in vpool, sized once at create and never grown. */
+    sigma_field_values_fn mfn;
+    uint16_t* vxoff; /* first extra value of a field in vpool */
+    uint8_t* vxn; /* extra values of a field, past the first */
+    uint8_t* vtrunc; /* 1 = the field had more values than were kept */
+    sigma_val_t* vpool;
+    uint32_t vpool_used;
+    uint64_t values_truncated; /* fields that lost values this scratch's lifetime */
+    uint64_t values_negated_truncated; /* negated predicates that held on such a field */
 };
+
+/* Values kept per field, and extra values kept per event over all fields. */
+#define SIGMA_FIELD_VALUES_MAX 16
+#define SIGMA_VALUE_POOL 512
 
 void sigma_eval_get_stats(const sigma_eval_t* e, sigma_eval_stats_t* out) {
     if (!out) return;
@@ -128,7 +145,17 @@ void sigma_eval_reset_stats(sigma_eval_t* e) {
     if (e) {
         memset(&e->st, 0, sizeof(e->st));
         e->re_unknown = 0;
+        e->values_truncated = 0;
+        e->values_negated_truncated = 0;
     }
+}
+
+uint64_t sigma_eval_values_truncated(const sigma_eval_t* e) {
+    return e ? e->values_truncated : 0;
+}
+
+uint64_t sigma_eval_values_negated_truncated(const sigma_eval_t* e) {
+    return e ? e->values_negated_truncated : 0;
 }
 
 uint64_t sigma_eval_re_unknown(const sigma_eval_t* e) {
@@ -192,7 +219,7 @@ static bool sg_ends(const char* s, size_t slen, const char* p, size_t plen, bool
 /* Parse a leading signed integer.  Returns false if no digits.  Tolerates a
  * trailing non-numeric suffix (e.g. "443/tcp" -> 443) so numeric ops are
  * robust against composite fields. */
-static bool sg_to_i64(const char* s, size_t len, int64_t* out) {
+static inline __attribute__((always_inline)) bool sg_to_i64(const char* s, size_t len, int64_t* out) {
     size_t i = 0;
     bool neg = false;
     if (i < len && (s[i] == '-' || s[i] == '+')) {
@@ -259,8 +286,50 @@ static bool ip_in_cidr(const char* val, size_t vlen, const sigma_cidr_t* c) {
     return false;
 }
 
+/* Resolve a field through the several-values callback. Entries with a NULL
+ * pointer are skipped; the first value kept goes to vptr/vlen, the others to
+ * vpool. A field loses values past SIGMA_FIELD_VALUES_MAX, or when vpool is
+ * full, and is then marked truncated. */
+static __attribute__((noinline)) uint8_t
+resolve_values(sigma_eval_t* e, void* ctx, uint16_t field_id, const char* name, uint32_t name_len) {
+    sigma_val_t tmp[SIGMA_FIELD_VALUES_MAX];
+    int n = e->mfn(ctx, name, name_len, tmp, SIGMA_FIELD_VALUES_MAX);
+    e->vxn[field_id] = 0;
+    e->vtrunc[field_id] = 0;
+    if (n <= 1) { /* the common case: absent, or one value */
+        e->vptr[field_id] = n == 1 ? tmp[0].ptr : NULL;
+        e->vlen[field_id] = (n == 1 && tmp[0].ptr) ? tmp[0].len : 0;
+        return 1;
+    }
+    uint32_t kept = 0, room = SIGMA_VALUE_POOL - e->vpool_used;
+    bool trunc = n > SIGMA_FIELD_VALUES_MAX;
+    e->vptr[field_id] = NULL;
+    e->vlen[field_id] = 0;
+    e->vxoff[field_id] = (uint16_t)e->vpool_used;
+    if (n > SIGMA_FIELD_VALUES_MAX) n = SIGMA_FIELD_VALUES_MAX;
+    for (int i = 0; i < n; i++) {
+        if (tmp[i].ptr == NULL) continue;
+        if (kept == 0) {
+            e->vptr[field_id] = tmp[i].ptr;
+            e->vlen[field_id] = tmp[i].len;
+        } else if (room > 0) {
+            e->vpool[e->vpool_used++] = tmp[i];
+            e->vxn[field_id]++;
+            room--;
+        } else {
+            trunc = true;
+            break;
+        }
+        kept++;
+    }
+    e->vtrunc[field_id] = trunc ? 1 : 0;
+    if (trunc) e->values_truncated++;
+    return (trunc || e->vxn[field_id] > 0) ? 2 : 1;
+}
+
 /* Resolve (and memoize) a field value for the current event. */
-static const char* resolve_field(sigma_eval_t* e, sigma_field_fn fn, void* ctx, uint16_t field_id, size_t* out_len) {
+static inline __attribute__((always_inline)) const char* resolve_field(
+    sigma_eval_t* e, sigma_field_fn fn, void* ctx, uint16_t field_id, size_t* out_len) {
     const sigma_db_t* db = e->db;
     if (field_id >= db->n_fields) {
         *out_len = 0;
@@ -268,14 +337,34 @@ static const char* resolve_field(sigma_eval_t* e, sigma_field_fn fn, void* ctx, 
     }
     if (!e->vstate[field_id]) {
         const sigma_str_t* f = &db->fields[field_id];
-        size_t vlen = 0;
-        const char* v = fn(ctx, db->strpool + f->off, f->len, &vlen);
-        e->vptr[field_id] = v;
-        e->vlen[field_id] = v ? vlen : 0;
-        e->vstate[field_id] = 1;
+        if (e->mfn) {
+            e->vstate[field_id] = resolve_values(e, ctx, field_id, db->strpool + f->off, f->len);
+        } else {
+            size_t vlen = 0;
+            const char* v = fn(ctx, db->strpool + f->off, f->len, &vlen);
+            e->vptr[field_id] = v;
+            e->vlen[field_id] = v ? vlen : 0;
+            e->vstate[field_id] = 1;
+        }
     }
     *out_len = e->vlen[field_id];
     return e->vptr[field_id];
+}
+
+/* Number of values of a field already resolved by resolve_field, and the i-th
+ * of them (i = 0 is the vptr/vlen value). */
+static inline uint32_t field_nvals(const sigma_eval_t* e, uint16_t field_id) {
+    return e->mfn ? 1u + e->vxn[field_id] : 1u;
+}
+
+static inline const char* field_val(const sigma_eval_t* e, uint16_t field_id, uint32_t i, size_t* len) {
+    if (i == 0) {
+        *len = e->vlen[field_id];
+        return e->vptr[field_id];
+    }
+    const sigma_val_t* v = &e->vpool[e->vxoff[field_id] + i - 1];
+    *len = v->len;
+    return v->ptr;
 }
 
 /* Three-valued (Kleene) logic. A predicate is unknown when the engine could
@@ -298,9 +387,19 @@ static inline tv_t tv_or(tv_t a, tv_t b) {
     return (a == TV_UNKNOWN || b == TV_UNKNOWN) ? TV_UNKNOWN : TV_FALSE;
 }
 
-static tv_t pred_match(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigma_pred_t* p, uint32_t pred_idx) {
-    size_t vlen = 0;
-    const char* val = resolve_field(e, fn, ctx, p->field_id, &vlen);
+/* A predicate on one value of its field, the field's first value when `mv`
+ * is false. Compiled with `mv` constant: with mv false this is the
+ * single-value predicate, and with mv true |fieldref compares against every
+ * value of the referenced field. Negation is left to the caller when `mv`, as
+ * it applies to the result over all values. */
+static inline __attribute__((always_inline)) tv_t pred_body(sigma_eval_t* e,
+                                                            sigma_field_fn fn,
+                                                            void* ctx,
+                                                            const sigma_pred_t* p,
+                                                            uint32_t pred_idx,
+                                                            const char* val,
+                                                            size_t vlen,
+                                                            const bool mv) {
     bool res = false;
 
     if (p->op == SIGMA_OP_EXISTS) {
@@ -355,6 +454,8 @@ static tv_t pred_match(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigm
         default: {
             const char* o;
             size_t olen;
+            uint16_t rid = 0;
+            uint32_t nr = 1;
             if (p->flags & SIGMA_PF_FIELDREF) {
                 /* |fieldref: the operand is the value of ANOTHER field, so value_id
                  * indexes the FIELDS table (not values). Resolve it via the memo;
@@ -362,14 +463,17 @@ static tv_t pred_match(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigm
                  * rejects a value_id a u16 field_id could never denote (a corrupt
                  * artifact), keeping the cast in-range. */
                 if (p->value_id >= e->db->n_fields || p->value_id > 0xFFFFu) break;
-                o = resolve_field(e, fn, ctx, (uint16_t)p->value_id, &olen);
+                rid = (uint16_t)p->value_id;
+                o = resolve_field(e, fn, ctx, rid, &olen);
                 if (o == NULL) break;
+                if (mv) nr = field_nvals(e, rid); /* any value of one equal to any of the other */
             } else {
                 const sigma_str_t* opnd = db_str(e->db->values, e->db->n_values, p->value_id);
                 if (!opnd) break;
                 o = e->db->strpool + opnd->off;
                 olen = opnd->len;
             }
+        next_operand:
             switch (p->op) {
                 case SIGMA_OP_EQ:
                     res = sg_eq(val, vlen, o, olen, cs);
@@ -392,18 +496,69 @@ static tv_t pred_match(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigm
                     res = false;
                     break;
             }
+            if (mv && !res && nr > 1 && --nr > 0) {
+                o = field_val(e, rid, field_nvals(e, rid) - nr, &olen);
+                goto next_operand;
+            }
             break;
         }
     }
 
 done:
-    if (p->flags & SIGMA_PF_NEGATE) res = !res;
+    if (!mv && (p->flags & SIGMA_PF_NEGATE)) res = !res;
     return res ? TV_TRUE : TV_FALSE;
+}
+
+/* A predicate on the single-value path (sigma_eval_run). */
+static inline __attribute__((always_inline)) tv_t
+pred_match(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigma_pred_t* p, uint32_t pred_idx) {
+    size_t vlen = 0;
+    const char* val = resolve_field(e, fn, ctx, p->field_id, &vlen);
+    return pred_body(e, fn, ctx, p, pred_idx, val, vlen, false);
+}
+
+/* A predicate over every value of its field (sigma_eval_run_values): a value
+ * predicate holds when any value matches, exists when any value is non-empty,
+ * and negation applies to that result, so a negated predicate holds when no
+ * value matches. */
+static __attribute__((noinline)) tv_t pred_match_values_all(sigma_eval_t* e,
+                                                            sigma_field_fn fn,
+                                                            void* ctx,
+                                                            const sigma_pred_t* p,
+                                                            uint32_t pred_idx,
+                                                            const char* val,
+                                                            size_t vlen) {
+    const uint32_t n = val ? field_nvals(e, p->field_id) : 0;
+    tv_t r = pred_body(e, fn, ctx, p, pred_idx, val, vlen, true);
+    for (uint32_t i = 1; i < n && r != TV_TRUE; i++) {
+        const char* v = field_val(e, p->field_id, i, &vlen);
+        r = tv_or(r, pred_body(e, fn, ctx, p, pred_idx, v, vlen, true));
+    }
+    if (p->flags & SIGMA_PF_NEGATE) {
+        if (r == TV_FALSE && val != NULL && e->vtrunc[p->field_id]) e->values_negated_truncated++;
+        r = tv_not(r);
+    }
+    return r;
+}
+
+/* Most fields resolve to one value, or none: those take the single-value
+ * predicate inline. |fieldref (the other field may have several values) and a
+ * truncated field take the loop above. */
+static inline __attribute__((always_inline)) tv_t
+pred_match_values(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigma_pred_t* p, uint32_t pred_idx) {
+    size_t vlen = 0;
+    const char* val = resolve_field(e, fn, ctx, p->field_id, &vlen);
+    if (e->vstate[p->field_id] == 1 && !(p->flags & SIGMA_PF_FIELDREF))
+        return pred_body(e, fn, ctx, p, pred_idx, val, vlen, false);
+    return pred_match_values_all(e, fn, ctx, p, pred_idx, val, vlen);
 }
 
 /* Selection = AND across groups, OR within a group (Sigma map semantics).
  * Predicates are contiguous and grouped by the builder. */
-static tv_t sel_match(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigma_sel_t* sel) {
+/* The selection body, compiled twice: `mv` is a constant in each copy, so the
+ * single-value copy carries no test for the several-values path. */
+static inline __attribute__((always_inline)) tv_t
+sel_match_body(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigma_sel_t* sel, const bool mv) {
     if (sel->pred_count == 0) return TV_FALSE;
     const sigma_db_t* db = e->db;
     const sigma_pred_t* preds = db->preds + sel->pred_start;
@@ -421,10 +576,32 @@ static tv_t sel_match(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigma
             group_or = TV_FALSE;
             cur_group = preds[i].group_id;
         }
-        if (group_or != TV_TRUE) /* short-circuit: skip rest of an already-true group */
-            group_or = tv_or(group_or, pred_match(e, fn, ctx, &preds[i], sel->pred_start + i));
+        if (group_or != TV_TRUE) { /* short-circuit: skip rest of an already-true group */
+            tv_t r = mv ? pred_match_values(e, fn, ctx, &preds[i], sel->pred_start + i)
+                        : pred_match(e, fn, ctx, &preds[i], sel->pred_start + i);
+            group_or = tv_or(group_or, r);
+        }
     }
     return tv_and(all, group_or); /* AND with the final group */
+}
+
+static __attribute__((noinline)) tv_t sel_match_one(sigma_eval_t* e,
+                                                    sigma_field_fn fn,
+                                                    void* ctx,
+                                                    const sigma_sel_t* sel) {
+    return sel_match_body(e, fn, ctx, sel, false);
+}
+
+static __attribute__((noinline)) tv_t sel_match_values(sigma_eval_t* e,
+                                                       sigma_field_fn fn,
+                                                       void* ctx,
+                                                       const sigma_sel_t* sel) {
+    return sel_match_body(e, fn, ctx, sel, true);
+}
+
+static inline __attribute__((always_inline)) tv_t
+sel_match(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigma_sel_t* sel, const bool mv) {
+    return mv ? sel_match_values(e, fn, ctx, sel) : sel_match_one(e, fn, ctx, sel);
 }
 
 /* RPN cell: a bool, a not-yet-run selection, or a deferred NOT of a selection.
@@ -440,14 +617,15 @@ typedef struct {
     uint32_t sel_idx;
 } rpn_cell_t;
 
-static tv_t rpn_force(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigma_rule_t* r, rpn_cell_t* c) {
+static inline __attribute__((always_inline)) tv_t
+rpn_force(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigma_rule_t* r, rpn_cell_t* c, const bool mv) {
     if (c->kind == RPN_BOOL) return c->val;
     if (c->sel_idx >= r->sel_count) {
         c->kind = RPN_BOOL;
         c->val = TV_FALSE;
         return TV_FALSE;
     }
-    tv_t hit = sel_match(e, fn, ctx, &e->db->sels[r->sel_start + c->sel_idx]);
+    tv_t hit = sel_match(e, fn, ctx, &e->db->sels[r->sel_start + c->sel_idx], mv);
     if (c->kind == RPN_NOTSEL) hit = tv_not(hit);
     c->kind = RPN_BOOL;
     c->val = hit;
@@ -458,13 +636,14 @@ static tv_t rpn_force(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigma
  * selections.  Otherwise run the compiled RPN over local selection results.
  * An unknown condition fires: an input that makes a |re undecidable must not
  * hide the event, whichever side of a NOT the pattern sits on. */
-static bool rule_match(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigma_rule_t* r) {
+static inline __attribute__((always_inline)) bool rule_match(
+    sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigma_rule_t* r, const bool mv) {
     const sigma_db_t* db = e->db;
 
     /* Implicit AND-of-all when there is no explicit condition. */
     if (r->cond_count == 0) {
         for (uint32_t i = 0; i < r->sel_count; i++)
-            if (sel_match(e, fn, ctx, &db->sels[r->sel_start + i]) == TV_FALSE) return false;
+            if (sel_match(e, fn, ctx, &db->sels[r->sel_start + i], mv) == TV_FALSE) return false;
         return r->sel_count > 0;
     }
 
@@ -497,18 +676,18 @@ static bool rule_match(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigm
                 if (sp < 2) return false;
                 rpn_cell_t b = stack[--sp];
                 rpn_cell_t* a = &stack[sp - 1];
-                tv_t av = rpn_force(e, fn, ctx, r, a);
+                tv_t av = rpn_force(e, fn, ctx, r, a, mv);
                 a->kind = RPN_BOOL;
-                a->val = av == TV_FALSE ? TV_FALSE : tv_and(av, rpn_force(e, fn, ctx, r, &b));
+                a->val = av == TV_FALSE ? TV_FALSE : tv_and(av, rpn_force(e, fn, ctx, r, &b, mv));
                 break;
             }
             case SIGMA_C_OR: {
                 if (sp < 2) return false;
                 rpn_cell_t b = stack[--sp];
                 rpn_cell_t* a = &stack[sp - 1];
-                tv_t av = rpn_force(e, fn, ctx, r, a);
+                tv_t av = rpn_force(e, fn, ctx, r, a, mv);
                 a->kind = RPN_BOOL;
-                a->val = av == TV_TRUE ? TV_TRUE : tv_or(av, rpn_force(e, fn, ctx, r, &b));
+                a->val = av == TV_TRUE ? TV_TRUE : tv_or(av, rpn_force(e, fn, ctx, r, &b, mv));
                 break;
             }
             default:
@@ -516,7 +695,7 @@ static bool rule_match(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigm
         }
     }
     if (sp != 1) return false;
-    return rpn_force(e, fn, ctx, r, &stack[0]) != TV_FALSE;
+    return rpn_force(e, fn, ctx, r, &stack[0], mv) != TV_FALSE;
 }
 
 sigma_eval_t* sigma_eval_create(const sigma_db_t* db) {
@@ -529,7 +708,11 @@ sigma_eval_t* sigma_eval_create(const sigma_db_t* db) {
     e->vptr = calloc(nf, sizeof(*e->vptr));
     e->vlen = calloc(nf, sizeof(*e->vlen));
     e->vstate = calloc(nf, sizeof(*e->vstate));
-    if (!e->vptr || !e->vlen || !e->vstate) {
+    e->vxoff = calloc(nf, sizeof(*e->vxoff));
+    e->vxn = calloc(nf, sizeof(*e->vxn));
+    e->vtrunc = calloc(nf, sizeof(*e->vtrunc));
+    e->vpool = calloc(SIGMA_VALUE_POOL, sizeof(*e->vpool));
+    if (!e->vptr || !e->vlen || !e->vstate || !e->vxoff || !e->vxn || !e->vtrunc || !e->vpool) {
         sigma_eval_free(e);
         return NULL;
     }
@@ -563,6 +746,10 @@ void sigma_eval_free(sigma_eval_t* e) {
     free(e->vptr);
     free(e->vlen);
     free(e->vstate);
+    free(e->vxoff);
+    free(e->vxn);
+    free(e->vtrunc);
+    free(e->vpool);
     free(e->rule_mask);
     free(e->rule_gen);
     free(e->eval_done);
@@ -754,15 +941,21 @@ fail:
 
 /* Evaluate one rule (by table index) and, on a match, emit a hit into out[].
  * `fired` is the running match count (incremented here on a match). */
-static inline void eval_one_rule(
-    sigma_eval_t* e, sigma_field_fn fn, void* ctx, uint32_t rule_idx, sigma_hit_t* out, int max_hits, int* fired) {
+static inline __attribute__((always_inline)) void eval_one_rule_body(sigma_eval_t* e,
+                                                                     sigma_field_fn fn,
+                                                                     void* ctx,
+                                                                     uint32_t rule_idx,
+                                                                     sigma_hit_t* out,
+                                                                     int max_hits,
+                                                                     int* fired,
+                                                                     const bool mv) {
     const sigma_db_t* db = e->db;
     if (e->eval_done) {
         if (e->eval_done[rule_idx] == e->gen) return;
         e->eval_done[rule_idx] = e->gen;
     }
     const sigma_rule_t* r = &db->rules[rule_idx];
-    if (!rule_match(e, fn, ctx, r)) return;
+    if (!rule_match(e, fn, ctx, r, mv)) return;
     if (out && *fired < max_hits) {
         out[*fired].rule_id = r->rule_id;
         out[*fired].verdict = r->verdict;
@@ -780,6 +973,16 @@ static inline void eval_one_rule(
         }
     }
     (*fired)++;
+}
+
+static void eval_one_rule(
+    sigma_eval_t* e, sigma_field_fn fn, void* ctx, uint32_t rule_idx, sigma_hit_t* out, int max_hits, int* fired) {
+    eval_one_rule_body(e, fn, ctx, rule_idx, out, max_hits, fired, false);
+}
+
+static void eval_one_rule_values(
+    sigma_eval_t* e, sigma_field_fn fn, void* ctx, uint32_t rule_idx, sigma_hit_t* out, int max_hits, int* fired) {
+    eval_one_rule_body(e, fn, ctx, rule_idx, out, max_hits, fired, true);
 }
 
 /* ----------------------------------------------------------------------------
@@ -854,9 +1057,10 @@ static inline bool scan_field(const sigma_db_t* db, const uint32_t* buckets, uin
 
 /* A numeric/CIDR CNF atom holds on this event. Same necessary-condition
  * contract as a Teddy posting: true means that clause may be credited. */
-static bool fwit_holds(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigma_fwit_t* w) {
-    size_t vlen = 0;
-    const char* val = resolve_field(e, fn, ctx, w->field_id, &vlen);
+static inline __attribute__((always_inline)) bool fwit_holds_one(const sigma_eval_t* e,
+                                                                 const sigma_fwit_t* w,
+                                                                 const char* val,
+                                                                 size_t vlen) {
     if (!val || vlen == 0) return false;
     if (w->op == SIGMA_OP_CIDR) {
         uint32_t cid = (uint32_t)w->ival;
@@ -879,6 +1083,20 @@ static bool fwit_holds(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigm
         default:
             return false;
     }
+}
+
+/* Any value of the field holds the atom. */
+static bool fwit_holds(sigma_eval_t* e, sigma_field_fn fn, void* ctx, const sigma_fwit_t* w) {
+    size_t vlen = 0;
+    const char* val = resolve_field(e, fn, ctx, w->field_id, &vlen);
+    if (!val) return false;
+    if (fwit_holds_one(e, w, val, vlen)) return true;
+    if (__builtin_expect(e->mfn == NULL, 1)) return false;
+    for (uint32_t i = 1, n = field_nvals(e, w->field_id); i < n; i++) {
+        val = field_val(e, w->field_id, i, &vlen);
+        if (fwit_holds_one(e, w, val, vlen)) return true;
+    }
+    return false;
 }
 
 /* Compute the candidate set for one event.  Returns true when the caller may
@@ -919,10 +1137,15 @@ static bool prefilter_candidates(
             }
             size_t vlen = 0;
             const char* v = resolve_field(e, fn, ctx, (uint16_t)f, &vlen);
-            if (!v || vlen < 2) continue; /* a needle is at least 2 bytes */
+            if (!v) continue;
             e->cur_field = (uint16_t)f;
-            teddy_confirm(tf, v, vlen, &e->tscr, mark_postings, e);
-            scanned += vlen;
+            /* Each value is its own haystack: a literal never spans two. */
+            for (uint32_t i = 0, n = field_nvals(e, (uint16_t)f); i < n; i++) {
+                if (i > 0) v = field_val(e, (uint16_t)f, i, &vlen);
+                if (!v || vlen < 2) continue; /* a needle is at least 2 bytes */
+                teddy_confirm(tf, v, vlen, &e->tscr, mark_postings, e);
+                scanned += vlen;
+            }
         }
     }
     e->st.chain_steps = e->tscr.chain_steps;
@@ -956,7 +1179,8 @@ static inline void eval_bucket_prefiltered(sigma_eval_t* e,
                                            sigma_hit_t* out,
                                            int max_hits,
                                            int* fired,
-                                           bool prefiltered) {
+                                           bool prefiltered,
+                                           const bool mv) {
     const sigma_db_t* db = e->db;
     const sigma_bucket_t* b = &db->buckets[bucket_idx];
     const uint32_t* idx = db->bucket_idx + b->idx_start;
@@ -965,7 +1189,10 @@ static inline void eval_bucket_prefiltered(sigma_eval_t* e,
         uint32_t ri = idx[i];
         if (prefiltered && !pf_is_candidate(e, ri)) continue; /* a necessary clause has no literal present */
         e->st.rules_verified++;
-        eval_one_rule(e, fn, ctx, ri, out, max_hits, fired);
+        if (mv)
+            eval_one_rule_values(e, fn, ctx, ri, out, max_hits, fired);
+        else
+            eval_one_rule(e, fn, ctx, ri, out, max_hits, fired);
     }
 }
 
@@ -983,11 +1210,26 @@ static uint32_t find_category_bucket(const sigma_db_t* db, const char* cat, size
     return UINT32_MAX;
 }
 
+/* Add the bucket a route token names to sel[], once. */
+static void route_token(const sigma_db_t* db, const char* v, size_t vlen, uint32_t* sel, uint32_t* nsel) {
+    uint32_t b = find_category_bucket(db, v, vlen);
+    if (b == UINT32_MAX) return;
+    for (uint32_t k = 0; k < *nsel; k++)
+        if (sel[k] == b) return;
+    if (*nsel < SIGMA_MAX_ROUTE_BUCKETS) sel[(*nsel)++] = b;
+}
+
+/* Reset the per-event field memo. */
+static inline void reset_memo(sigma_eval_t* e) {
+    if (e->db->n_fields) memset(e->vstate, 0, e->db->n_fields * sizeof(*e->vstate));
+    e->vpool_used = 0;
+}
+
 /* Full linear scan over every rule.  Resets the memo, then evaluates all rules
  * in table order. */
 static int eval_linear(sigma_eval_t* e, sigma_field_fn fn, void* ctx, sigma_hit_t* out, int max_hits) {
     const sigma_db_t* db = e->db;
-    if (db->n_fields) memset(e->vstate, 0, db->n_fields * sizeof(*e->vstate));
+    reset_memo(e);
     bump_eval_gen(e);
     int fired = 0;
     for (uint32_t i = 0; i < db->n_rules; i++) eval_one_rule(e, fn, ctx, i, out, max_hits, &fired);
@@ -999,12 +1241,14 @@ int sigma_eval_run_linear(sigma_eval_t* e, sigma_field_fn fn, void* ctx, sigma_h
     return eval_linear(e, fn, ctx, out, max_hits);
 }
 
-int sigma_eval_run(sigma_eval_t* e, sigma_field_fn fn, void* ctx, sigma_hit_t* out, int max_hits) {
-    if (!e || !fn) return 0;
+/* One event through the bucket index. On the several-values path e->mfn is
+ * set and fn is NULL: every field read goes through resolve_field or mfn. */
+static inline __attribute__((always_inline)) int eval_run(
+    sigma_eval_t* e, sigma_field_fn fn, void* ctx, sigma_hit_t* out, int max_hits, const bool mv) {
     const sigma_db_t* db = e->db;
 
     /* Reset the per-event resolve memo (cheap: one memset over n_fields). */
-    if (db->n_fields) memset(e->vstate, 0, db->n_fields * sizeof(*e->vstate));
+    reset_memo(e);
     e->st.events++;
     bump_eval_gen(e);
 
@@ -1043,18 +1287,39 @@ int sigma_eval_run(sigma_eval_t* e, sigma_field_fn fn, void* ctx, sigma_hit_t* o
         for (unsigned i = 0; i < sizeof route / sizeof route[0]; i++) {
             size_t vlen = 0;
             const char* v;
-            if (i == 0 && db->cat_field_id != UINT32_MAX)
-                v = resolve_field(e, fn, ctx, (uint16_t)db->cat_field_id, &vlen);
-            else
-                v = fn(ctx, route[i].name, route[i].len, &vlen);
+            if (i == 0 && db->cat_field_id != UINT32_MAX) {
+                /* Every value of the category field is a route token. */
+                uint16_t cf = (uint16_t)db->cat_field_id;
+                v = resolve_field(e, fn, ctx, cf, &vlen);
+                if (!mv) {
+                    if (!v || vlen == 0) continue;
+                    had_route = 1;
+                    route_token(db, v, vlen, sel, &nsel);
+                    continue;
+                }
+                for (uint32_t j = 0, n = v ? field_nvals(e, cf) : 0; j < n; j++) {
+                    if (j > 0) v = field_val(e, cf, j, &vlen);
+                    if (!v || vlen == 0) continue;
+                    had_route = 1;
+                    route_token(db, v, vlen, sel, &nsel);
+                }
+                continue;
+            }
+            if (mv) {
+                sigma_val_t tv[SIGMA_FIELD_VALUES_MAX];
+                int n = e->mfn(ctx, route[i].name, route[i].len, tv, SIGMA_FIELD_VALUES_MAX);
+                if (n > SIGMA_FIELD_VALUES_MAX) n = SIGMA_FIELD_VALUES_MAX;
+                for (int j = 0; j < n; j++) {
+                    if (!tv[j].ptr || tv[j].len == 0) continue;
+                    had_route = 1;
+                    route_token(db, tv[j].ptr, tv[j].len, sel, &nsel);
+                }
+                continue;
+            }
+            v = fn(ctx, route[i].name, route[i].len, &vlen);
             if (!v || vlen == 0) continue;
             had_route = 1;
-            uint32_t b = find_category_bucket(db, v, vlen);
-            if (b == UINT32_MAX) continue;
-            uint32_t k;
-            for (k = 0; k < nsel; k++)
-                if (sel[k] == b) break;
-            if (k == nsel && nsel < SIGMA_MAX_ROUTE_BUCKETS) sel[nsel++] = b;
+            route_token(db, v, vlen, sel, &nsel);
         }
         if (db->av_bucket != UINT32_MAX) {
             uint32_t k;
@@ -1072,7 +1337,8 @@ int sigma_eval_run(sigma_eval_t* e, sigma_field_fn fn, void* ctx, sigma_hit_t* o
                 }
             }
             bool pf = big ? prefilter_candidates(e, fn, ctx, sel, nsel) : false;
-            for (uint32_t i = 0; i < nsel; i++) eval_bucket_prefiltered(e, fn, ctx, sel[i], out, max_hits, &fired, pf);
+            for (uint32_t i = 0; i < nsel; i++)
+                eval_bucket_prefiltered(e, fn, ctx, sel[i], out, max_hits, &fired, pf, mv);
             return fired;
         }
         /* No route field at all: soundness over speed, full scan. */
@@ -1080,7 +1346,25 @@ int sigma_eval_run(sigma_eval_t* e, sigma_field_fn fn, void* ctx, sigma_hit_t* o
 
     e->st.rules_in_scope += db->n_rules;
     e->st.rules_verified += db->n_rules;
-    for (uint32_t i = 0; i < db->n_rules; i++) eval_one_rule(e, fn, ctx, i, out, max_hits, &fired);
+    for (uint32_t i = 0; i < db->n_rules; i++) {
+        if (mv)
+            eval_one_rule_values(e, fn, ctx, i, out, max_hits, &fired);
+        else
+            eval_one_rule(e, fn, ctx, i, out, max_hits, &fired);
+    }
+    return fired;
+}
+
+int sigma_eval_run(sigma_eval_t* e, sigma_field_fn fn, void* ctx, sigma_hit_t* out, int max_hits) {
+    if (!e || !fn) return 0;
+    return eval_run(e, fn, ctx, out, max_hits, false);
+}
+
+int sigma_eval_run_values(sigma_eval_t* e, sigma_field_values_fn fn, void* ctx, sigma_hit_t* out, int max_hits) {
+    if (!e || !fn) return 0;
+    e->mfn = fn;
+    int fired = eval_run(e, NULL, ctx, out, max_hits, true);
+    e->mfn = NULL;
     return fired;
 }
 
