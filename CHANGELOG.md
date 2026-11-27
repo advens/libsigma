@@ -15,6 +15,12 @@ are unchanged.
 
 ### Added
 
+- `sigma_eval_run_values` matches events whose fields carry several values,
+  such as an ECS array. A value predicate holds when any value matches, a
+  negated one when none does, and every value of a route field selects its
+  bucket. `sigma_eval_values_truncated` and
+  `sigma_eval_values_negated_truncated` count the fields past the value
+  bounds. `sigma_eval_run` is unchanged and costs the same.
 - `corr_engine_set_memory` bounds the bytes of group state across all
   correlations. `corr_engine_memory_stats` returns the bytes in use and how
   many groups were evicted to keep the budget.
