@@ -10,6 +10,8 @@ is called out explicitly.
 
 ## [Unreleased]
 
+## [4.3.0] - 2026-11-27
+
 MINOR: additive C ABI. The SONAME, the `.sigmac` format, and the contrib wire
 are unchanged.
 
@@ -299,7 +301,8 @@ First tagged release.
   the contribution codec; ASan/UBSan and TSan gates.
 - Normative on-disk format specification, `src/docs/SIGMAC_FORMAT.md`.
 
-[Unreleased]: https://github.com/advens/libsigma/compare/4.2.0...HEAD
+[Unreleased]: https://github.com/advens/libsigma/compare/4.3.0...HEAD
+[4.3.0]: https://github.com/advens/libsigma/releases/tag/4.3.0
 [4.2.0]: https://github.com/advens/libsigma/releases/tag/4.2.0
 [4.1.1]: https://github.com/advens/libsigma/releases/tag/4.1.1
 [4.1.0]: https://github.com/advens/libsigma/releases/tag/4.1.0
