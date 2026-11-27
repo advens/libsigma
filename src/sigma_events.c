@@ -4,8 +4,9 @@
  *
  * Explain never re-implements an operator.  It points a one-rule view of the
  * loaded db (same fields, values, predicates, CIDRs, regex table, string pool)
- * at a single predicate or selection and runs sigma_eval_run_linear on it, so
- * every verdict it reports comes from the matcher's own code.
+ * at a single predicate or selection and runs sigma_eval_run_values on it (the
+ * view has no bucket index, so the scan is linear), so every verdict it
+ * reports comes from the matcher's own code.
  *
  * Copyright 2026 Advens.
  * Author: Jeremie Jourdin <jeremie.jourdin@advens.fr>
@@ -472,17 +473,15 @@ static const char* leaf_value(struct json_object* v, size_t* out_len) {
     return s;
 }
 
-/* sigma_field_fn over one parsed event (ctx is its json_object). */
-static const char* ev_field(void* ctx, const char* name, uint32_t name_len, size_t* out_len) {
-    struct json_object* root = ctx;
+/* The JSON node a rule field name names in one parsed event, or NULL. */
+static struct json_object* ev_node(struct json_object* root, const char* name, uint32_t name_len) {
     char key[EV_NAME_MAX];
     struct json_object* v = NULL;
 
-    *out_len = 0;
     if (root == NULL || name == NULL || name_len == 0 || name_len >= EV_NAME_MAX) return NULL;
     memcpy(key, name, name_len);
     key[name_len] = '\0';
-    if (json_object_object_get_ex(root, key, &v)) return leaf_value(v, out_len);
+    if (json_object_object_get_ex(root, key, &v)) return v;
     if (strchr(key, '.') == NULL) return NULL;
 
     struct json_object* cur = root;
@@ -496,11 +495,59 @@ static const char* ev_field(void* ctx, const char* name, uint32_t name_len, size
         part[klen] = '\0';
         struct json_object* next = NULL;
         if (!json_object_object_get_ex(cur, part, &next)) return NULL;
-        if (dot == NULL) return leaf_value(next, out_len);
+        if (dot == NULL) return next;
         if (next == NULL || !json_object_is_type(next, json_type_object)) return NULL;
         cur = next;
         seg = dot + 1;
     }
+}
+
+/* A scalar leaf, or the first scalar element of an array leaf. */
+static const char* first_value(struct json_object* v, size_t* out_len) {
+    if (v != NULL && json_object_is_type(v, json_type_array)) {
+        size_t n = json_object_array_length(v);
+        for (size_t i = 0; i < n; i++) {
+            const char* s = leaf_value(json_object_array_get_idx(v, i), out_len);
+            if (s != NULL) return s;
+        }
+        return NULL;
+    }
+    return leaf_value(v, out_len);
+}
+
+/* sigma_field_values_fn over one parsed event (ctx is its json_object): a
+ * scalar leaf is one value, an array leaf gives its scalar elements in order. */
+static int ev_values(void* ctx, const char* name, uint32_t name_len, sigma_val_t* out, int max) {
+    struct json_object* v = ev_node(ctx, name, name_len);
+    size_t len = 0;
+    if (v != NULL && json_object_is_type(v, json_type_array)) {
+        size_t n = json_object_array_length(v);
+        int k = 0;
+        /* Counting one past max is enough: a return above max says values were dropped. */
+        for (size_t i = 0; i < n && k <= max; i++) {
+            const char* s = leaf_value(json_object_array_get_idx(v, i), &len);
+            if (s == NULL) continue;
+            if (k < max) {
+                out[k].ptr = s;
+                out[k].len = len;
+            }
+            k++;
+        }
+        return k;
+    }
+    const char* s = leaf_value(v, &len);
+    if (s == NULL) return 0;
+    if (max > 0) {
+        out[0].ptr = s;
+        out[0].len = len;
+    }
+    return 1;
+}
+
+/* One value per field for the event clock and the correlator: the first. */
+static const char* ev_field(void* ctx, const char* name, uint32_t name_len, size_t* out_len) {
+    *out_len = 0;
+    return first_value(ev_node(ctx, name, name_len), out_len);
 }
 
 /* corr_field_fn: same resolution, empty values included. */
@@ -641,7 +688,7 @@ char* sigma_events_info_json(const sigma_events_t* se) {
 }
 
 static int run_match(sigma_events_t* se, struct json_object* ev) {
-    int n = sigma_eval_run(se->eval, ev_field, ev, se->hits, se->hits_cap);
+    int n = sigma_eval_run_values(se->eval, ev_values, ev, se->hits, se->hits_cap);
     if (n < 0) return 0;
     return n > se->hits_cap ? se->hits_cap : n;
 }
@@ -683,7 +730,8 @@ char* sigma_events_match_json(sigma_events_t* se, const char* events, size_t len
  * -------------------------------------------------------------------------- */
 static int view_run(sigma_events_t* se, struct json_object* ev) {
     sigma_hit_t h;
-    return sigma_eval_run_linear(se->veval, ev_field, ev, &h, 1) > 0;
+    /* The view has no bucket index, so this is a linear scan of its one rule. */
+    return sigma_eval_run_values(se->veval, ev_values, ev, &h, 1) > 0;
 }
 
 static void view_one_sel(sigma_events_t* se, const sigma_rule_t* r) {
@@ -718,6 +766,51 @@ static int eval_rule_unrouted(sigma_events_t* se, struct json_object* ev, const 
     se->view.n_cond = se->db.n_cond;
     se->vrule = *r;
     return view_run(se, ev);
+}
+
+/* The element of an array field that an explain answer echoes: the first one
+ * whose own verdict, the predicate run on an event where the field holds only
+ * that element, equals the verdict on the whole array. A predicate that holds
+ * shows the element that matched, a negated predicate that fails shows the
+ * element that broke it. The shadow event borrows the event's top-level
+ * members and adds the field as a whole-name key, which wins over the nested
+ * path. NULL when no element qualifies or memory runs out. */
+static const char* array_echo(sigma_events_t* se,
+                              struct json_object* ev,
+                              const sigma_rule_t* r,
+                              uint32_t pred_idx,
+                              const char* fname,
+                              size_t flen,
+                              struct json_object* arr,
+                              int verdict,
+                              size_t* out_len) {
+    char key[EV_NAME_MAX];
+    if (flen == 0 || flen >= EV_NAME_MAX) return NULL;
+    memcpy(key, fname, flen);
+    key[flen] = '\0';
+    struct json_object* sh = json_object_new_object();
+    if (sh == NULL) return NULL;
+    struct json_object_iterator it = json_object_iter_begin(ev);
+    struct json_object_iterator end = json_object_iter_end(ev);
+    for (; !json_object_iter_equal(&it, &end); json_object_iter_next(&it)) {
+        const char* k = json_object_iter_peek_name(&it);
+        if (strcmp(k, key) != 0) json_object_object_add(sh, k, json_object_get(json_object_iter_peek_value(&it)));
+    }
+    const char* got = NULL;
+    size_t n = json_object_array_length(arr);
+    for (size_t i = 0; i < n && got == NULL; i++) {
+        struct json_object* el = json_object_array_get_idx(arr, i);
+        size_t len = 0;
+        const char* v = leaf_value(el, &len);
+        if (v == NULL) continue;
+        json_object_object_add(sh, key, json_object_get(el));
+        if (eval_pred(se, sh, r, pred_idx) == verdict) {
+            got = v;
+            *out_len = len;
+        }
+    }
+    json_object_put(sh);
+    return got;
 }
 
 static void sb_cidr(sb_t* b, const sigma_cidr_t* c) {
@@ -790,7 +883,17 @@ static void sb_pred(sb_t* b, sigma_events_t* se, struct json_object* ev, const s
     sb_bool(b, (p->flags & SIGMA_PF_FIELDREF) != 0);
 
     size_t vlen = 0;
-    const char* got = fname != NULL ? ev_field(ev, fname, (uint32_t)flen, &vlen) : NULL;
+    const int matched = eval_pred(se, ev, r, pred_idx);
+    struct json_object* node = fname != NULL ? ev_node(ev, fname, (uint32_t)flen) : NULL;
+    const char* got = first_value(node, &vlen);
+    if (got != NULL && json_object_is_type(node, json_type_array)) {
+        size_t elen = 0;
+        const char* el = array_echo(se, ev, r, pred_idx, fname, flen, node, matched, &elen);
+        if (el != NULL) {
+            got = el;
+            vlen = elen;
+        }
+    }
     sb_lit(b, ",\"present\":");
     sb_bool(b, got != NULL);
     sb_lit(b, ",\"got\":");
@@ -801,7 +904,7 @@ static void sb_pred(sb_t* b, sigma_events_t* se, struct json_object* ev, const s
     sb_lit(b, ",\"got_truncated\":");
     sb_bool(b, got != NULL && vlen > SIGMA_EVENTS_ECHO_MAX);
     sb_lit(b, ",\"matched\":");
-    sb_bool(b, eval_pred(se, ev, r, pred_idx));
+    sb_bool(b, matched);
     sb_lit(b, "}");
 }
 
