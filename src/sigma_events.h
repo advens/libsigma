@@ -10,9 +10,14 @@
  *     1. a top-level key equal to the whole name ("process.name": "x"), then
  *     2. the dotted path walked through nested objects
  *        ({"process": {"name": "x"}}).
- *   A leaf that is an object, an array, or null is absent.  Numbers and booleans
- *   match as the JSON library renders them ("8443", "true").  A path segment of
- *   128 bytes or more is absent.  Arrays are never searched element by element.
+ *   A leaf that is an object or null is absent.  Numbers and booleans match as
+ *   the JSON library renders them ("8443", "true").  A path segment of 128
+ *   bytes or more is absent.  An array leaf is a field with several values, its
+ *   scalar elements in order, matched as sigma_eval_run_values describes;
+ *   objects, arrays and nulls inside it are skipped.  The event clock and the
+ *   correlation keys and values use the first scalar element.  Explain echoes
+ *   ("got") the first element whose own verdict is the predicate's verdict:
+ *   the element that matched, or the one that broke a negated predicate.
  *
  *   Correlation clocks each event on the first of @timestamp, time, timestamp,
  *   event.created that event_time_parse() accepts, then on event.date plus

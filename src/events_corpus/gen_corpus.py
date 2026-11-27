@@ -137,6 +137,24 @@ def build() -> bytes:
     r = b.rule(100, sel, 1, severity=2, score_x100=20, name_id=b.value("SSH invalid user"))
     add(r, "sshd")
 
+    # 110: list fields. An event.type element is "denied" and a
+    # user.group.name element is "admins".
+    s0 = b.begin_sel()
+    b.pred("event.type", Op.EQ, value_id=b.value("denied"), group=0)
+    b.pred("user.group.name", Op.EQ, value_id=b.value("admins"), group=1)
+    sel = b.end_sel(s0)
+    r = b.rule(110, sel, 1, severity=3, score_x100=35, name_id=b.value("Admin denied"))
+    add(r, "authentication")
+
+    # 120: negated predicate on a list: dave, and no event.type element is
+    # "start".
+    s0 = b.begin_sel()
+    b.pred("user.name", Op.EQ, value_id=b.value("dave"), group=0)
+    b.pred("event.type", Op.EQ, value_id=b.value("start"), group=1, flags=PF_NEGATE)
+    sel = b.end_sel(s0)
+    r = b.rule(120, sel, 1, severity=1, score_x100=10, name_id=b.value("Dave without a start"))
+    add(r, "authentication")
+
     b.set_buckets(buckets)
     return b.serialize()
 

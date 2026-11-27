@@ -25,3 +25,9 @@
 {"_expect":[10,70],"_explain":[70],"event":{"category":"process"},"process":{"name":"powershell.exe","command_line":"powershell -enc \u00c9\u00c7 \ud83d\ude00 bob"},"user":{"name":"bob"}}
 {"_expect":[90],"event":{"category":["network","dns"]},"dns":{"question":{"name":"x.onion"}}}
 {"_expect":[20],"event":{"category":"authentication","action":"authentication_failure"},"source":{"ip":"203.0.113.9"},"user":{"name":"carol"}}
+{"_expect":[110],"_explain":[110],"event":{"category":"authentication","type":["start","denied"]},"user":{"name":"eve","group":{"name":["users","admins"]}}}
+{"_expect":[],"_explain":[110],"event":{"category":"authentication","type":["start","denied"]},"user":{"name":"eve","group":{"name":["users"]}}}
+{"_expect":[120],"_explain":[120],"event":{"category":"authentication","type":["info","end"]},"user":{"name":"dave"}}
+{"_expect":[],"_explain":[120],"event":{"category":"authentication","type":["end","start"]},"user":{"name":"dave"}}
+{"_expect":[110],"event":{"category":["web","authentication"],"type":["denied"]},"user":{"name":"frank","group":{"name":"admins"}}}
+{"_expect":[],"_explain":[110],"event":{"category":"authentication","type":[{"name":"denied"},null,["denied"]]},"user":{"name":"eve","group":{"name":"admins"}}}

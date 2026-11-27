@@ -176,7 +176,12 @@ static void test_event_model(sigma_events_t* se) {
     check(match_one(se, k_corpus[0]) == B(100), "flat key: contains");
     check(match_one(se, k_corpus[1]) == B(100), "nested path, case-insensitive contains");
     check(match_one(se, k_corpus[2]) == B(200), "endswith, escaped backslashes");
-    check(match_one(se, k_corpus[3]) == 0, "array leaf is absent");
+    check(match_one(se, k_corpus[3]) == B(200), "array leaf: one element");
+    check(match_one(se, "{\"process\":{\"name\":[\"notepad.exe\",\"mimikatz.exe\"]}}") == B(200),
+          "array leaf: any element");
+    check(match_one(se, "{\"process\":{\"name\":[{\"x\":\"mimikatz.exe\"},null,[\"mimikatz.exe\"]]}}") == 0,
+          "array leaf: objects, nulls and nested arrays are skipped");
+    check(match_one(se, "{\"destination\":{\"port\":[80,8443]}}") == B(300), "array leaf: numeric element");
     check(match_one(se, k_corpus[4]) == B(300), "numeric gte on a string");
     check(match_one(se, k_corpus[5]) == B(300), "numeric gte on a JSON number");
     check(match_one(se, k_corpus[6]) == 0, "numeric gte below the bound");

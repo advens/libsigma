@@ -29,6 +29,13 @@ are unchanged.
   a numeric value as the engine does. A peer that sends a partial for an
   event it does not own uses them to send what the owner would apply.
 
+### Changed
+
+- The JSON front end (`sigma_events`, the WebAssembly module) reads an array
+  leaf as a field with several values instead of an absent one. Explain
+  echoes the element that decided the predicate. The event clock and the
+  correlation keys use the first element.
+
 ### Security
 
 - A correlation group key and a distinct value were stored as full copies

@@ -49,7 +49,7 @@ test("versions", async () => {
   const eng = m.load(sigmac);
   const info = eng.info();
   assert.equal(info.schema, 1);
-  assert.equal(info.n_rules, 10);
+  assert.equal(info.n_rules, 12);
   eng.close();
 });
 
